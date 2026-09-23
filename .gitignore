@@ -1,0 +1,38 @@
+# OS
+.DS_Store
+Thumbs.db
+
+# Editors
+.vscode/
+.idea/
+*.swp
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Rust
+target/
+**/*.rs.bk
+*.pdb
+pkg/
+
+# Node / web builds
+node_modules/
+dist/
+build/
+.cache/
+*.log
+
+# Env
+.env
+.env.*
+
+# Media (raw captures and generated outputs)
+*.mov
+*.MOV
+*.mp4
+*.mkv
+!test_video.mp4
