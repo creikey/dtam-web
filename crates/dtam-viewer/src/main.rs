@@ -1,4 +1,6 @@
 mod app;
+mod ar;
+mod scene3d;
 
 #[cfg(not(target_arch = "wasm32"))]
 fn main() -> eframe::Result {
@@ -6,7 +8,7 @@ fn main() -> eframe::Result {
     let args = match Args::parse() {
         Ok(a) => a,
         Err(e) => {
-            eprintln!("{e}\n\nusage: dtam-viewer [VIDEO] [--max-dim N]");
+            eprintln!("{e}\n\nusage: dtam-viewer [VIDEO] [--max-dim N] [--scene]");
             std::process::exit(2);
         }
     };
@@ -20,7 +22,7 @@ fn main() -> eframe::Result {
     eframe::run_native(
         "dtam-viewer",
         options,
-        Box::new(move |cc| Ok(Box::new(app::ViewerApp::new_native(cc, args.video, args.max_dim)))),
+        Box::new(move |cc| Ok(Box::new(app::ViewerApp::new_native(cc, args.video, args.max_dim, args.scene)))),
     )
 }
 
@@ -33,6 +35,8 @@ fn main() {
 struct Args {
     video: std::path::PathBuf,
     max_dim: u32,
+    /// Start on the 3D scene tab.
+    scene: bool,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -40,6 +44,7 @@ impl Args {
     fn parse() -> Result<Self, String> {
         let mut video = None;
         let mut max_dim = 1024;
+        let mut scene = false;
         let mut it = std::env::args().skip(1);
         while let Some(a) = it.next() {
             match a.as_str() {
@@ -49,6 +54,7 @@ impl Args {
                         .and_then(|v| v.parse().ok())
                         .ok_or("--max-dim needs a positive integer")?;
                 }
+                "--scene" => scene = true,
                 "-h" | "--help" => return Err("DTAM viewer".into()),
                 _ if video.is_none() => video = Some(a.into()),
                 _ => return Err(format!("unexpected argument {a:?}")),
@@ -57,6 +63,7 @@ impl Args {
         Ok(Self {
             video: video.unwrap_or_else(|| "test_video.mp4".into()),
             max_dim,
+            scene,
         })
     }
 }

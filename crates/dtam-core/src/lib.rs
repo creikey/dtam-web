@@ -3,10 +3,15 @@
 //! Runs on native (Metal/Vulkan/DX12) and is written to also run on
 //! wasm32 + browser WebGPU: all GPU readbacks are async.
 
+pub mod ar;
 pub mod calib;
+pub mod dtam;
 pub mod frame;
+pub mod geom;
 pub mod gpu;
 pub mod pipeline;
+pub mod sfm;
+pub mod slam;
 pub mod tracker;
 
 pub use frame::Frame;

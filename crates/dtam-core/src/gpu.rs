@@ -37,6 +37,10 @@ impl Gpu {
     }
 
     pub(crate) fn compute_pipeline(&self, label: &str, wgsl: &str) -> wgpu::ComputePipeline {
+        self.compute_pipeline_entry(label, wgsl, "cs_main")
+    }
+
+    pub(crate) fn compute_pipeline_entry(&self, label: &str, wgsl: &str, entry: &str) -> wgpu::ComputePipeline {
         let module = self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some(label),
             source: wgpu::ShaderSource::Wgsl(wgsl.into()),
@@ -45,7 +49,7 @@ impl Gpu {
             label: Some(label),
             layout: None,
             module: &module,
-            entry_point: Some("cs_main"),
+            entry_point: Some(entry),
             compilation_options: Default::default(),
             cache: None,
         })
@@ -74,6 +78,14 @@ impl Gpu {
             size: size.max(16).next_multiple_of(4),
             usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
+        })
+    }
+
+    pub(crate) fn storage_init(&self, label: &str, data: &[u8], extra: wgpu::BufferUsages) -> wgpu::Buffer {
+        self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some(label),
+            contents: data,
+            usage: wgpu::BufferUsages::STORAGE | extra,
         })
     }
 

@@ -562,6 +562,7 @@ version = "0.1.0"
 dependencies = [
  "dtam-core",
  "dtam-video",
+ "nalgebra",
  "pollster 0.4.0",
 ]
 
@@ -588,11 +589,13 @@ dependencies = [
 name = "dtam-viewer"
 version = "0.1.0"
 dependencies = [
+ "bytemuck",
  "dtam-core",
  "dtam-video",
  "eframe",
  "env_logger",
  "log",
+ "nalgebra",
  "pollster 0.4.0",
  "wgpu",
 ]

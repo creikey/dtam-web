@@ -8,7 +8,12 @@ license.workspace = true
 name = "dtam-calibrate"
 path = "src/calibrate.rs"
 
+[[bin]]
+name = "dtam-slam"
+path = "src/slam.rs"
+
 [dependencies]
 dtam-core = { path = "../dtam-core" }
 dtam-video = { path = "../dtam-video" }
 pollster.workspace = true
+nalgebra.workspace = true

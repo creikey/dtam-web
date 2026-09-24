@@ -11,6 +11,8 @@ wgpu.workspace = true
 pollster.workspace = true
 log.workspace = true
 env_logger = "0.11"
+bytemuck.workspace = true
+nalgebra.workspace = true
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 dtam-video = { path = "../dtam-video" }

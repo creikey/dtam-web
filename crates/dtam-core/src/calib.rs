@@ -217,8 +217,37 @@ pub fn essential_cost(fundamental: &Matrix3<f64>, f: f64, cx: f64, cy: f64) -> f
     if s[0] <= 0.0 { 1.0 } else { (s[0] - s[1]) / s[0] }
 }
 
+/// Robust fundamental matrix (`x2ᵀ F x1 = 0`) and its inlier count.
+pub fn fit_fundamental(
+    x1: &[[f64; 2]],
+    x2: &[[f64; 2]],
+    inlier_px: f64,
+    iters: usize,
+    seed: u64,
+) -> Option<(Matrix3<f64>, usize)> {
+    let params = FocalParams { inlier_px, ransac_iters: iters, ..Default::default() };
+    ransac_fundamental(x1, x2, &params, &mut Rng(seed | 1))
+}
+
+/// Inlier count of the best homography `x2 ~ H x1`.
+pub fn fit_homography_inliers(
+    x1: &[[f64; 2]],
+    x2: &[[f64; 2]],
+    inlier_px: f64,
+    iters: usize,
+    seed: u64,
+) -> usize {
+    let params = FocalParams { inlier_px, ransac_iters: iters, ..Default::default() };
+    ransac_homography(x1, x2, &params, &mut Rng(seed | 1))
+}
+
+/// Squared Sampson distance (px²) of a match to `F`.
+pub fn sampson_distance(f: &Matrix3<f64>, a: [f64; 2], b: [f64; 2]) -> f64 {
+    sampson(f, a, b)
+}
+
 /// Positions of tracks present in both frames (points are sorted by id).
-fn matches(a: &FrameTracks, b: &FrameTracks) -> (Vec<[f64; 2]>, Vec<[f64; 2]>) {
+pub fn matches(a: &FrameTracks, b: &FrameTracks) -> (Vec<[f64; 2]>, Vec<[f64; 2]>) {
     let (mut x1, mut x2) = (Vec::new(), Vec::new());
     let (mut i, mut j) = (0, 0);
     while i < a.points.len() && j < b.points.len() {

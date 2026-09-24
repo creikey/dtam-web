@@ -209,7 +209,6 @@ impl KltTracker {
         }
         let last = levels.last().unwrap();
         let slot_size = last.off + last.w * last.h;
-        println!("{}", last.off);
         let tiles = (width.div_ceil(TILE), height.div_ceil(TILE));
         let cap = params.max_features as u64;
 

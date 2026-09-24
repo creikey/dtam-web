@@ -2,6 +2,9 @@
 
 use std::sync::{Arc, Mutex};
 
+use dtam_core::dtam::{Keyframe, TrackStats};
+use dtam_core::geom::{Intrinsics, Se3};
+use dtam_core::slam::PoseSource;
 use dtam_core::{Frame, FrameOutput, TrackedPoint};
 use eframe::egui::{
     self, Align2, Color32, ColorImage, FontId, Key, Pos2, Rect, Sense, Stroke, TextureHandle,
@@ -22,6 +25,15 @@ pub struct Session {
     pub fps: f32,
     pub done: bool,
     pub error: Option<String>,
+
+    /// SLAM (after decoding + KLT finish).
+    pub slam_stage: String,
+    pub slam_done: bool,
+    /// (self-calibrated f, bundle-adjusted intrinsics, DTAM mapping intrinsics).
+    pub intrinsics: Option<(f64, Intrinsics, Intrinsics)>,
+    pub poses: Vec<Option<(Se3, PoseSource)>>,
+    pub track_stats: Vec<Option<TrackStats>>,
+    pub keyframes: Vec<Arc<Keyframe>>,
 }
 
 pub struct ViewerApp {
@@ -44,6 +56,38 @@ pub struct ViewerApp {
     show_ids: bool,
     point_radius: f32,
     selected_track: Option<u32>,
+
+    view: View,
+    image_mode: ImageMode,
+    show_mask: bool,
+    mask_opacity: f32,
+    mask_texture: Option<(usize, TextureHandle)>,
+    selected_keyframe: Option<usize>,
+    keyframe_textures: Option<((usize, usize), [TextureHandle; 3])>,
+    scene: crate::scene3d::Scene3d,
+    scene_centered: bool,
+
+    show_cube: bool,
+    cube_size: f32,
+    cube: Option<crate::ar::Cube>,
+    /// (frame, keyframe) the cube should be anchored from; None = not yet.
+    cube_anchor_request: Option<usize>,
+    occlude_cube: bool,
+    cube_version: u64,
+    cube_texture: Option<((usize, bool, u64), TextureHandle)>,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum View {
+    Frames,
+    Scene,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum ImageMode {
+    Video,
+    Prediction,
+    PredictedDepth,
 }
 
 impl ViewerApp {
@@ -65,12 +109,28 @@ impl ViewerApp {
             show_ids: false,
             point_radius: 2.5,
             selected_track: None,
+            view: View::Frames,
+            image_mode: ImageMode::Video,
+            show_mask: false,
+            mask_opacity: 0.45,
+            mask_texture: None,
+            selected_keyframe: None,
+            keyframe_textures: None,
+            scene: Default::default(),
+            scene_centered: false,
+            show_cube: true,
+            cube_size: 0.12,
+            cube: None,
+            cube_anchor_request: Some(0),
+            occlude_cube: true,
+            cube_version: 0,
+            cube_texture: None,
         }
     }
 
     /// Decodes + processes the video on a worker thread using the UI's wgpu device.
     #[cfg(not(target_arch = "wasm32"))]
-    pub fn new_native(cc: &eframe::CreationContext<'_>, video: std::path::PathBuf, max_dim: u32) -> Self {
+    pub fn new_native(cc: &eframe::CreationContext<'_>, video: std::path::PathBuf, max_dim: u32, scene: bool) -> Self {
         let session = Arc::new(Mutex::new(Session {
             source: video.display().to_string(),
             fps: 30.0,
@@ -81,13 +141,28 @@ impl ViewerApp {
         let ctx = cc.egui_ctx.clone();
         let shared = session.clone();
         std::thread::spawn(move || {
-            let result = run_pipeline(&video, max_dim, gpu, &shared, &ctx);
-            let mut s = shared.lock().unwrap();
-            s.done = true;
-            s.error = result.err();
+            let result = run_pipeline(&video, max_dim, gpu.clone(), &shared, &ctx);
+            {
+                let mut s = shared.lock().unwrap();
+                s.done = true;
+                s.error = result.as_ref().err().cloned();
+            }
             ctx.request_repaint();
+            if result.is_ok() {
+                let result = run_slam(gpu, &shared, &ctx);
+                let mut s = shared.lock().unwrap();
+                s.slam_done = true;
+                if let Err(e) = result {
+                    s.slam_stage = format!("SLAM failed: {e}");
+                }
+                ctx.request_repaint();
+            }
         });
-        Self::new(session)
+        let mut app = Self::new(session);
+        if scene {
+            app.view = View::Scene;
+        }
+        app
     }
 }
 
@@ -123,13 +198,81 @@ fn run_pipeline(
     Ok(())
 }
 
+/// Self-calibration, feature bootstrap, then DTAM mapping + dense tracking
+/// at half the video resolution. Results stream into the session.
+#[cfg(not(target_arch = "wasm32"))]
+fn run_slam(gpu: dtam_core::Gpu, shared: &Mutex<Session>, ctx: &egui::Context) -> Result<(), String> {
+    use dtam_core::slam::{SlamEvent, SlamParams, run};
+    let (tracks, size) = {
+        let mut s = shared.lock().unwrap();
+        let f0 = s.frames.first().ok_or("no frames")?;
+        let size = (f0.width, f0.height);
+        let n = s.frames.len();
+        s.poses = vec![None; n];
+        s.track_stats = vec![None; n];
+        (s.outputs.iter().map(|o| o.tracks.clone()).collect::<Vec<_>>(), size)
+    };
+    pollster::block_on(run(
+        gpu,
+        &tracks,
+        size,
+        |i| shared.lock().unwrap().frames[i].downsample2(),
+        &SlamParams::default(),
+        |ev| {
+            let mut s = shared.lock().unwrap();
+            match ev {
+                SlamEvent::Stage(st) => s.slam_stage = st,
+                SlamEvent::Intrinsics { self_calibrated, refined, mapping } => {
+                    s.intrinsics = Some((self_calibrated, refined, mapping))
+                }
+                SlamEvent::Pose { frame, pose, source } => s.poses[frame] = Some((pose, source)),
+                SlamEvent::Tracking { frame, stats } => s.track_stats[frame] = Some(stats),
+                SlamEvent::Keyframe(kf) => {
+                    if kf.id < s.keyframes.len() {
+                        let id = kf.id;
+                        s.keyframes[id] = kf;
+                    } else {
+                        s.keyframes.push(kf);
+                    }
+                }
+            }
+            ctx.request_repaint();
+        },
+    ))
+}
+
+fn gray_image(w: u32, h: u32, v: &[u8]) -> ColorImage {
+    let rgb: Vec<u8> = v.iter().flat_map(|g| [*g, *g, *g]).collect();
+    ColorImage::from_rgb([w as usize, h as usize], &rgb)
+}
+
+/// Inverse depth to a perceptual ramp (near = warm, far = cool, 0 = black).
+fn depth_color(t: f32) -> [u8; 3] {
+    if t <= 0.0 {
+        return [0, 0, 0];
+    }
+    let t = t.clamp(0.0, 1.0);
+    let r = (255.0 * (1.5 * t - 0.25).clamp(0.0, 1.0)) as u8;
+    let g = (255.0 * (1.0 - (2.0 * t - 1.0).abs()).powf(0.7)) as u8;
+    let b = (255.0 * (1.0 - 1.6 * t).clamp(0.0, 1.0).max(0.25)) as u8;
+    [r, g, b]
+}
+
+fn depth_image(w: u32, h: u32, xi: &[f32], range: (f32, f32)) -> ColorImage {
+    let rgb: Vec<u8> = xi
+        .iter()
+        .flat_map(|v| if *v > 0.0 { depth_color(((v - range.0) / (range.1 - range.0)).max(1e-3)) } else { [0, 0, 0] })
+        .collect();
+    ColorImage::from_rgb([w as usize, h as usize], &rgb)
+}
+
 /// Points in each frame are sorted by id (survivors keep order, new ids are appended).
 fn find_point(points: &[TrackedPoint], id: u32) -> Option<&TrackedPoint> {
     points.binary_search_by_key(&id, |p| p.id).ok().map(|i| &points[i])
 }
 
 impl eframe::App for ViewerApp {
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         let session = self.session.clone();
         let s = session.lock().unwrap();
         let n = s.frames.len();
@@ -150,11 +293,24 @@ impl eframe::App for ViewerApp {
         egui::Panel::top("top").show(ui, |ui| self.top_bar(ui, &s));
         egui::Panel::bottom("timeline").show(ui, |ui| self.timeline(ui, &s));
         egui::Panel::right("inspector")
-            .default_size(260.0)
+            .default_size(320.0)
+            .size_range(220.0..=560.0)
             .show(ui, |ui| self.inspector(ui, &s));
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE.fill(Color32::from_gray(18)))
-            .show(ui, |ui| self.viewport(ui, &s));
+            .show(ui, |ui| match self.view {
+                View::Frames => self.viewport(ui, &s),
+                View::Scene => {
+                    if let Some(rs) = frame.wgpu_render_state() {
+                        if !self.scene_centered && !s.keyframes.is_empty() {
+                            self.scene.reset_view(&s.keyframes);
+                            self.scene_centered = true;
+                        }
+                        let k = s.intrinsics.map(|i| i.2);
+                        self.scene.ui(ui, rs, &s.keyframes, &s.poses, k, self.current);
+                    }
+                }
+            });
     }
 }
 
@@ -191,6 +347,8 @@ impl ViewerApp {
     fn top_bar(&mut self, ui: &mut egui::Ui, s: &Session) {
         ui.horizontal(|ui| {
             ui.strong("DTAM");
+            ui.selectable_value(&mut self.view, View::Frames, "Frames");
+            ui.selectable_value(&mut self.view, View::Scene, "3D scene");
             ui.separator();
             ui.label(&s.source);
             if let Some(f) = s.frames.first() {
@@ -201,7 +359,11 @@ impl ViewerApp {
             if let Some(err) = &s.error {
                 ui.colored_label(Color32::LIGHT_RED, err);
             } else if s.done {
-                ui.label(format!("processed {n} frames"));
+                ui.label(format!("tracked {n} frames"));
+                ui.separator();
+                let color = if s.slam_done { Color32::from_gray(160) } else { Color32::from_rgb(255, 200, 80) };
+                let dense = s.poses.iter().flatten().filter(|p| p.1 == PoseSource::Dense).count();
+                ui.colored_label(color, format!("SLAM: {} · {} keyframes · {dense} dense poses", s.slam_stage, s.keyframes.len()));
             } else {
                 let total = s.expected_frames.unwrap_or(0);
                 let frac = if total > 0 { n as f32 / total as f32 } else { 0.0 };
@@ -258,14 +420,37 @@ impl ViewerApp {
                 GREEN.gamma_multiply(0.45),
             );
         }
+        // Pose source strip along the top, keyframe ticks.
+        let strip = 6.0;
+        for (i, p) in s.poses.iter().enumerate() {
+            let Some((_, src)) = p else { continue };
+            let x = rect.left() + i as f32 * bar_w;
+            let c = match src {
+                PoseSource::Bootstrap => Color32::from_rgb(120, 220, 120),
+                PoseSource::Dense => Color32::from_rgb(90, 160, 255),
+                PoseSource::Predicted => Color32::from_rgb(255, 80, 60),
+            };
+            painter.rect_filled(
+                Rect::from_min_max(Pos2::new(x, rect.top()), Pos2::new(x + bar_w.max(1.0), rect.top() + strip)),
+                0.0,
+                c,
+            );
+        }
+        for kf in &s.keyframes {
+            let x = rect.left() + (kf.frame as f32 + 0.5) * bar_w;
+            painter.line_segment(
+                [Pos2::new(x, rect.top()), Pos2::new(x, rect.bottom())],
+                Stroke::new(1.5, Color32::from_rgb(255, 170, 40)),
+            );
+        }
         if n > 0 {
             let x = rect.left() + (self.current as f32 + 0.5) * bar_w;
             painter.line_segment([Pos2::new(x, rect.top()), Pos2::new(x, rect.bottom())], Stroke::new(2.0, Color32::WHITE));
         }
         painter.text(
-            rect.left_top() + Vec2::new(4.0, 2.0),
+            rect.left_top() + Vec2::new(4.0, strip + 2.0),
             Align2::LEFT_TOP,
-            format!("tracked points (max {max_pts})"),
+            format!("tracked points (max {max_pts}) · top strip: pose source (green bootstrap, blue dense, red lost) · orange: keyframes"),
             FontId::proportional(11.0),
             Color32::from_gray(160),
         );
@@ -285,7 +470,171 @@ impl ViewerApp {
     }
 
     fn inspector(&mut self, ui: &mut egui::Ui, s: &Session) {
-        ui.heading("Tracker");
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            self.slam_inspector(ui, s);
+            ui.separator();
+            self.klt_inspector(ui, s);
+        });
+    }
+
+    fn slam_inspector(&mut self, ui: &mut egui::Ui, s: &Session) {
+        ui.heading("Camera");
+        match &s.intrinsics {
+            Some((f0, k, km)) => {
+                egui::Grid::new("intr").num_columns(2).striped(true).show(ui, |ui| {
+                    ui.label("self-calibrated f");
+                    ui.monospace(format!("{f0:.1} px"));
+                    ui.end_row();
+                    ui.label("bundle-adjusted f");
+                    ui.monospace(format!("{:.1} px", k.fx));
+                    ui.end_row();
+                    ui.label("horizontal FOV");
+                    ui.monospace(format!("{:.2}°", k.hfov_deg()));
+                    ui.end_row();
+                    ui.label("principal point");
+                    ui.monospace(format!("({:.1}, {:.1})", k.cx, k.cy));
+                    ui.end_row();
+                    ui.label("DTAM resolution");
+                    ui.monospace(format!("{}×{} f {:.1}", km.width, km.height, km.fx));
+                    ui.end_row();
+                });
+            }
+            None => {
+                ui.weak(if s.done { "calibrating…" } else { "waiting for tracks…" });
+            }
+        }
+
+        ui.separator();
+        ui.heading("Pose");
+        match s.poses.get(self.current).copied().flatten() {
+            Some((pose, src)) => {
+                let label = match src {
+                    PoseSource::Bootstrap => "feature bootstrap (BA)",
+                    PoseSource::Dense => "dense tracking",
+                    PoseSource::Predicted => "LOST — motion model",
+                };
+                egui::Grid::new("pose").num_columns(2).striped(true).show(ui, |ui| {
+                    ui.label("source");
+                    ui.monospace(label);
+                    ui.end_row();
+                    ui.label("position");
+                    ui.monospace(format!("({:.3}, {:.3}, {:.3})", pose.t.x, pose.t.y, pose.t.z));
+                    ui.end_row();
+                    ui.label("rotation");
+                    ui.monospace(format!("{:.2}° from frame 0", pose.rotation_angle().to_degrees()));
+                    ui.end_row();
+                    if let Some(t) = s.track_stats.get(self.current).and_then(|t| t.as_ref()) {
+                        ui.label("photometric rmse");
+                        ui.monospace(format!("{:.4}", t.rmse));
+                        ui.end_row();
+                        ui.label("used / rejected");
+                        ui.monospace(format!("{:.0}% / {:.0}%", t.used_fraction * 100.0, t.rejected_fraction * 100.0));
+                        ui.end_row();
+                        ui.label("model coverage");
+                        ui.monospace(format!("{:.0}%", t.coverage * 100.0));
+                        ui.end_row();
+                        ui.label("gain / bias");
+                        ui.monospace(format!("{:.3} / {:+.3}", t.gain, t.bias));
+                        ui.end_row();
+                        ui.label("GN iterations");
+                        ui.monospace(t.iterations.to_string());
+                        ui.end_row();
+                    }
+                });
+            }
+            None => {
+                ui.weak("no pose yet");
+            }
+        }
+        ui.horizontal(|ui| {
+            ui.label("image");
+            ui.selectable_value(&mut self.image_mode, ImageMode::Video, "video");
+            ui.selectable_value(&mut self.image_mode, ImageMode::Prediction, "model");
+            ui.selectable_value(&mut self.image_mode, ImageMode::PredictedDepth, "model depth");
+        });
+        ui.checkbox(&mut self.show_mask, "tracking mask (green used · yellow rejected · blue no model)");
+        ui.add_enabled(self.show_mask, egui::Slider::new(&mut self.mask_opacity, 0.1..=1.0).text("mask opacity"));
+
+        ui.separator();
+        ui.heading("Keyframes");
+        if s.keyframes.is_empty() {
+            ui.weak("none yet");
+        }
+        for kf in &s.keyframes {
+            let selected = self.selected_keyframe == Some(kf.id);
+            let text = format!(
+                "#{} · frame {} · {} views · ξ {:.2}–{:.2} · λ {:.2}",
+                kf.id, kf.frame, kf.frames_used, kf.xi_range.0, kf.xi_range.1, kf.lambda
+            );
+            if ui.selectable_label(selected, text).clicked() {
+                self.selected_keyframe = Some(kf.id);
+                self.seek(kf.frame);
+            }
+        }
+        if let Some(kf) = self.selected_keyframe.and_then(|i| s.keyframes.get(i)) {
+            if self.keyframe_textures.as_ref().is_none_or(|t| t.0 != (kf.id, kf.frames_used)) {
+                let (w, h) = (kf.intrinsics.width, kf.intrinsics.height);
+                let ctx = ui.ctx();
+                let opts = TextureOptions::LINEAR;
+                self.keyframe_textures = Some((
+                    (kf.id, kf.frames_used),
+                    [
+                        ctx.load_texture("kf_rgb", ColorImage::from_rgb([w as usize, h as usize], &kf.rgb), opts),
+                        ctx.load_texture("kf_argmin", depth_image(w, h, &kf.argmin_inv_depth, kf.xi_range), opts),
+                        ctx.load_texture("kf_depth", depth_image(w, h, &kf.inv_depth, kf.xi_range), opts),
+                    ],
+                ));
+            }
+            if let Some((_, [rgb, raw, reg])) = &self.keyframe_textures {
+                // Account for item spacing so the row never exceeds the panel
+                // (otherwise the resizable panel grows every frame).
+                let gap = ui.spacing().item_spacing.x;
+                let size = Vec2::splat(((ui.available_width() - 2.0 * gap) / 3.0 - 1.0).floor().max(24.0));
+                ui.horizontal(|ui| {
+                    for (t, label) in [(rgb, "reference"), (raw, "arg min C"), (reg, "regularised ξ")] {
+                        ui.vertical(|ui| {
+                            ui.add(egui::Image::new((t.id(), size)));
+                            ui.small(label);
+                        });
+                    }
+                });
+                ui.small(format!("{} primal-dual iterations, cost volume from {} views", kf.iterations, kf.frames_used));
+            }
+        }
+
+        ui.separator();
+        ui.heading("AR cube");
+        ui.checkbox(&mut self.show_cube, "draw tracked cube over the video");
+        ui.checkbox(&mut self.occlude_cube, "occlude with the model's predicted depth");
+        if ui.add(egui::Slider::new(&mut self.cube_size, 0.03..=0.4).text("size (× distance)")).changed() {
+            self.cube_anchor_request = Some(self.cube_anchor_request.unwrap_or(0));
+            self.cube = None;
+        }
+        if ui.button("re-anchor at this frame's image center").clicked() {
+            self.cube_version += 1;
+            self.cube_anchor_request = Some(self.current);
+            self.cube = None;
+        }
+        ui.small(match &self.cube {
+            Some(c) => format!("anchored at ({:.2}, {:.2}, {:.2})", c.base.x, c.base.y, c.base.z),
+            None => "waiting for the first keyframe".into(),
+        });
+
+        ui.separator();
+        ui.heading("3D scene");
+        let o = &mut self.scene.options;
+        ui.add(egui::Slider::new(&mut o.point_step, 1..=8).text("pixel step"));
+        ui.add(egui::Slider::new(&mut o.min_confidence, 0.0..=0.9).text("min depth confidence"))
+            .on_hover_text("(mean cost − cost at the solution) / mean cost: 0 = textureless, depth unconstrained by the images");
+        ui.add(egui::Slider::new(&mut o.point_size, 0.5..=5.0).text("point size px"));
+        ui.checkbox(&mut o.raw_argmin, "show raw arg min instead of regularised");
+        ui.checkbox(&mut o.color_by_keyframe, "color by keyframe");
+        ui.checkbox(&mut o.show_frustums, "keyframe frustums");
+        ui.checkbox(&mut o.show_path, "camera path");
+    }
+
+    fn klt_inspector(&mut self, ui: &mut egui::Ui, s: &Session) {
+        ui.heading("KLT tracker");
         if let Some(out) = s.outputs.get(self.current) {
             let t = &out.tracks;
             let tracked: Vec<_> = t.points.iter().filter(|p| p.age > 0).collect();
@@ -405,19 +754,84 @@ impl ViewerApp {
         let to_screen = |p: [f32; 2]| img_rect.min + Vec2::new(p[0] + 0.5, p[1] + 0.5) * scale;
 
         let nearest = scale > 3.0;
-        if self.texture_frame != Some((self.current, nearest)) {
-            let image = ColorImage::from_rgb([frame.width as usize, frame.height as usize], &frame.rgb);
+        let stats = s.track_stats.get(self.current).and_then(|t| t.as_ref());
+        let mode = match (self.image_mode, stats.and_then(|t| t.prediction.as_ref())) {
+            (ImageMode::Video, _) | (_, None) => 0,
+            (ImageMode::Prediction, _) => 1,
+            (ImageMode::PredictedDepth, _) => 2,
+        };
+        if self.texture_frame != Some((self.current * 4 + mode, nearest)) {
+            let image = match (mode, stats.and_then(|t| t.prediction.as_ref())) {
+                (1, Some((w, h, luma, _))) => gray_image(*w, *h, luma),
+                (2, Some((w, h, _, depth))) => {
+                    let rgb: Vec<u8> = depth.iter().flat_map(|v| depth_color(*v as f32 / 255.0)).collect();
+                    ColorImage::from_rgb([*w as usize, *h as usize], &rgb)
+                }
+                _ => ColorImage::from_rgb([frame.width as usize, frame.height as usize], &frame.rgb),
+            };
             let opts = if nearest { TextureOptions::NEAREST } else { TextureOptions::LINEAR };
             match &mut self.texture {
                 Some(t) => t.set(image, opts),
                 None => self.texture = Some(ui.ctx().load_texture("frame", image, opts)),
             }
-            self.texture_frame = Some((self.current, nearest));
+            self.texture_frame = Some((self.current * 4 + mode, nearest));
         }
 
         let painter = ui.painter_at(area);
+        let full_uv = Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0));
         if let Some(tex) = &self.texture {
-            painter.image(tex.id(), img_rect, Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)), Color32::WHITE);
+            painter.image(tex.id(), img_rect, full_uv, Color32::WHITE);
+        }
+        if self.show_mask
+            && let Some((w, h, mask)) = stats.and_then(|t| t.mask.as_ref())
+        {
+            if self.mask_texture.as_ref().is_none_or(|t| t.0 != self.current) {
+                let colors = [[40u8, 60, 230], [40, 230, 70], [245, 215, 40], [0, 0, 0]];
+                let rgba: Vec<u8> = mask
+                    .iter()
+                    .flat_map(|m| {
+                        let c = colors[(*m).min(3) as usize];
+                        [c[0], c[1], c[2], if *m == 3 { 0 } else { 255 }]
+                    })
+                    .collect();
+                let img = ColorImage::from_rgba_unmultiplied([*w as usize, *h as usize], &rgba);
+                self.mask_texture = Some((self.current, ui.ctx().load_texture("mask", img, TextureOptions::NEAREST)));
+            }
+            if let Some((_, t)) = &self.mask_texture {
+                painter.image(t.id(), img_rect, full_uv, Color32::WHITE.gamma_multiply(self.mask_opacity));
+            }
+        }
+
+        if self.show_cube
+            && let Some((_, k, _)) = s.intrinsics
+        {
+            if self.cube.is_none()
+                && let Some(f) = self.cube_anchor_request
+                && let Some(Some((pose, _))) = s.poses.get(f)
+                && let Some(kf) = s.keyframes.iter().min_by_key(|kf| kf.frame.abs_diff(f))
+            {
+                let center = [(k.width as f64 - 1.0) / 2.0, (k.height as f64 - 1.0) / 2.0];
+                self.cube = crate::ar::anchor(kf, pose, &k, center, self.cube_size as f64);
+                self.cube_version += 1;
+            }
+            if let (Some(cube), Some(Some((pose, _)))) = (&self.cube, s.poses.get(self.current))
+                && self.image_mode == ImageMode::Video
+            {
+                let key = (self.current, self.occlude_cube, self.cube_version);
+                if self.cube_texture.as_ref().is_none_or(|t| t.0 != key) {
+                    let depth = self
+                        .occlude_cube
+                        .then(|| stats.and_then(|t| t.prediction_inv_depth.as_ref()))
+                        .flatten()
+                        .map(|(w, h, d)| (*w, *h, d.as_slice()));
+                    let img = crate::ar::rasterize(cube, pose, &k, 512, depth)
+                        .unwrap_or_else(|| ColorImage::new([1, 1], vec![Color32::TRANSPARENT]));
+                    self.cube_texture = Some((key, ui.ctx().load_texture("cube", img, TextureOptions::LINEAR)));
+                }
+                if let Some((_, t)) = &self.cube_texture {
+                    painter.image(t.id(), img_rect, full_uv, Color32::WHITE);
+                }
+            }
         }
 
         let Some(out) = s.outputs.get(self.current) else { return };
