@@ -99,7 +99,7 @@ fn run_pipeline(
     shared: &Mutex<Session>,
     ctx: &egui::Context,
 ) -> Result<(), String> {
-    use crate::video;
+    use dtam_video as video;
     let info = video::probe(video)?;
     let size = video::scaled_size(&info, max_dim);
     {

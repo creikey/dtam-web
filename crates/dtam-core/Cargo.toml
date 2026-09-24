@@ -9,6 +9,7 @@ wgpu.workspace = true
 bytemuck.workspace = true
 log.workspace = true
 futures-channel = "0.3"
+nalgebra.workspace = true
 
 [dev-dependencies]
 pollster.workspace = true
