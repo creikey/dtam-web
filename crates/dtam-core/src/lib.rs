@@ -13,6 +13,7 @@ pub mod pipeline;
 pub mod sfm;
 pub mod slam;
 pub mod tracker;
+pub mod viz;
 
 pub use frame::Frame;
 pub use gpu::Gpu;

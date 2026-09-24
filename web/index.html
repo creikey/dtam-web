@@ -1,0 +1,73 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>DTAM in the browser</title>
+<meta name="description" content="Dense Tracking and Mapping (Newcombe, Lovegrove & Davison 2011) in Rust + WebGPU">
+<style>
+  html, body { margin: 0; height: 100%; background: #111316; color: #e6e8eb; overflow: hidden;
+    font: 15px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+  #app { width: 100%; height: 100%; display: block; }
+  #message { position: fixed; inset: 0; display: none; align-items: center; justify-content: center; padding: 24px; }
+  #message .card { max-width: 560px; background: #1b1e22; border: 1px solid #2d3238; border-radius: 12px; padding: 24px 28px; }
+  #message h1 { font-size: 20px; margin: 0 0 8px; }
+  #message p { margin: 8px 0; color: #b9bfc7; }
+  #message code { background: #0d0f11; padding: 1px 6px; border-radius: 4px; }
+  #loading { position: fixed; inset: 0; display: flex; align-items: center; justify-content: center; color: #8a939d; }
+</style>
+</head>
+<body>
+<canvas id="app"></canvas>
+<div id="loading">loading DTAM…</div>
+<div id="message"><div class="card">
+  <h1 id="msg-title">WebGPU isn't available</h1>
+  <p id="msg-body"></p>
+  <p id="msg-advice"></p>
+</div></div>
+<script type="module">
+function advice() {
+  const ua = navigator.userAgent;
+  if (/iPhone|iPad|iPod/.test(ua) || (/Macintosh/.test(ua) && navigator.maxTouchPoints > 1))
+    return "On iPhone and iPad, use <b>Safari on iOS/iPadOS 26 or newer</b> (on iOS 18, enable WebGPU in Settings › Apps › Safari › Advanced › Feature Flags).";
+  if (/Android/.test(ua))
+    return "On Android, use <b>Chrome 121 or newer</b> (Android 12+ with a recent GPU driver).";
+  if (/Macintosh/.test(ua))
+    return "On macOS, use <b>Chrome or Edge 113+</b>, or <b>Safari 26+</b>.";
+  if (/Windows/.test(ua))
+    return "On Windows, use <b>Chrome or Edge 113+</b> (or Firefox 141+).";
+  if (/Linux/.test(ua))
+    return "On Linux, use <b>Chrome</b> with WebGPU enabled (<code>chrome://flags/#enable-unsafe-webgpu</code> and Vulkan).";
+  return "Use a recent Chrome, Edge or Safari with WebGPU support.";
+}
+function fail(title, body) {
+  document.getElementById("loading").style.display = "none";
+  document.getElementById("app").style.display = "none";
+  document.getElementById("msg-title").textContent = title;
+  document.getElementById("msg-body").textContent = body;
+  document.getElementById("msg-advice").innerHTML = advice();
+  document.getElementById("message").style.display = "flex";
+}
+async function main() {
+  if (!("gpu" in navigator)) {
+    return fail("WebGPU isn't available", "This browser doesn't expose WebGPU, which DTAM needs for its GPU compute.");
+  }
+  let adapter = null;
+  try { adapter = await navigator.gpu.requestAdapter(); } catch (e) {}
+  if (!adapter) {
+    return fail("WebGPU didn't initialize", "The browser has WebGPU but couldn't get a GPU adapter (blocklisted driver or disabled hardware acceleration).");
+  }
+  try {
+    const wasm = await import("./pkg/dtam_viewer.js");
+    await wasm.default();
+    document.getElementById("loading").style.display = "none";
+    await wasm.start("app");
+  } catch (e) {
+    console.error(e);
+    fail("DTAM failed to start", String(e && e.message || e));
+  }
+}
+main();
+</script>
+</body>
+</html>

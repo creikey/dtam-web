@@ -65,7 +65,6 @@ pub struct ViewerApp {
     selected_keyframe: Option<usize>,
     keyframe_textures: Option<((usize, usize), [TextureHandle; 3])>,
     scene: crate::scene3d::Scene3d,
-    scene_centered: bool,
 
     show_cube: bool,
     cube_size: f32,
@@ -117,7 +116,6 @@ impl ViewerApp {
             selected_keyframe: None,
             keyframe_textures: None,
             scene: Default::default(),
-            scene_centered: false,
             show_cube: true,
             cube_size: 0.12,
             cube: None,
@@ -202,43 +200,54 @@ fn run_pipeline(
 /// at half the video resolution. Results stream into the session.
 #[cfg(not(target_arch = "wasm32"))]
 fn run_slam(gpu: dtam_core::Gpu, shared: &Mutex<Session>, ctx: &egui::Context) -> Result<(), String> {
-    use dtam_core::slam::{SlamEvent, SlamParams, run};
-    let (tracks, size) = {
+    use dtam_core::slam::{Slam, SlamEvent, SlamParams};
+    // SLAM runs on the video downscaled to <= 512 px (like the web app);
+    // intrinsics are reported back at video resolution for drawing.
+    let (n, video_w, mut small_w) = {
         let mut s = shared.lock().unwrap();
         let f0 = s.frames.first().ok_or("no frames")?;
-        let size = (f0.width, f0.height);
-        let n = s.frames.len();
+        let (w, n) = (f0.width, s.frames.len());
         s.poses = vec![None; n];
         s.track_stats = vec![None; n];
-        (s.outputs.iter().map(|o| o.tracks.clone()).collect::<Vec<_>>(), size)
+        (n, w, w)
     };
-    pollster::block_on(run(
-        gpu,
-        &tracks,
-        size,
-        |i| shared.lock().unwrap().frames[i].downsample2(),
-        &SlamParams::default(),
-        |ev| {
-            let mut s = shared.lock().unwrap();
-            match ev {
-                SlamEvent::Stage(st) => s.slam_stage = st,
-                SlamEvent::Intrinsics { self_calibrated, refined, mapping } => {
-                    s.intrinsics = Some((self_calibrated, refined, mapping))
-                }
-                SlamEvent::Pose { frame, pose, source } => s.poses[frame] = Some((pose, source)),
-                SlamEvent::Tracking { frame, stats } => s.track_stats[frame] = Some(stats),
-                SlamEvent::Keyframe(kf) => {
-                    if kf.id < s.keyframes.len() {
-                        let id = kf.id;
-                        s.keyframes[id] = kf;
-                    } else {
-                        s.keyframes.push(kf);
-                    }
+    let shrink = |mut f: Frame| {
+        while f.width.max(f.height) > 512 {
+            f = f.downsample2();
+        }
+        f
+    };
+    let first = shrink(shared.lock().unwrap().frames[0].clone());
+    small_w = small_w.min(first.width);
+    let to_video = video_w as f64 / small_w as f64;
+    let mut slam = Slam::new(gpu, (first.width, first.height), SlamParams::default());
+    let mut handler = |ev: SlamEvent| {
+        let mut s = shared.lock().unwrap();
+        match ev {
+            SlamEvent::Stage(st) => s.slam_stage = st,
+            SlamEvent::Intrinsics { self_calibrated, refined, mapping } => {
+                s.intrinsics = Some((self_calibrated * to_video, refined.scaled(to_video), mapping))
+            }
+            SlamEvent::Pose { frame, pose, source } => s.poses[frame] = Some((pose, source)),
+            SlamEvent::Tracking { frame, stats } => s.track_stats[frame] = Some(stats),
+            SlamEvent::Keyframe(kf) => {
+                if kf.id < s.keyframes.len() {
+                    let id = kf.id;
+                    s.keyframes[id] = kf;
+                } else {
+                    s.keyframes.push(kf);
                 }
             }
-            ctx.request_repaint();
-        },
-    ))
+            SlamEvent::Phase(_) | SlamEvent::Klt { .. } => {}
+        }
+        ctx.request_repaint();
+    };
+    for i in 0..n {
+        let fr = shrink(shared.lock().unwrap().frames[i].clone());
+        pollster::block_on(slam.push(&fr, &mut handler));
+    }
+    pollster::block_on(slam.finish(&mut handler));
+    Ok(())
 }
 
 fn gray_image(w: u32, h: u32, v: &[u8]) -> ColorImage {
@@ -302,12 +311,15 @@ impl eframe::App for ViewerApp {
                 View::Frames => self.viewport(ui, &s),
                 View::Scene => {
                     if let Some(rs) = frame.wgpu_render_state() {
-                        if !self.scene_centered && !s.keyframes.is_empty() {
-                            self.scene.reset_view(&s.keyframes);
-                            self.scene_centered = true;
-                        }
-                        let k = s.intrinsics.map(|i| i.2);
-                        self.scene.ui(ui, rs, &s.keyframes, &s.poses, k, self.current);
+                        let current = s
+                            .poses
+                            .get(self.current)
+                            .copied()
+                            .flatten()
+                            .zip(s.intrinsics.map(|i| i.2))
+                            .map(|((p, _), k)| (p, k));
+                        let size = ui.available_size();
+                        self.scene.ui(ui, rs, &s.keyframes, &s.poses, current, size);
                     }
                 }
             });
@@ -622,15 +634,7 @@ impl ViewerApp {
 
         ui.separator();
         ui.heading("3D scene");
-        let o = &mut self.scene.options;
-        ui.add(egui::Slider::new(&mut o.point_step, 1..=8).text("pixel step"));
-        ui.add(egui::Slider::new(&mut o.min_confidence, 0.0..=0.9).text("min depth confidence"))
-            .on_hover_text("(mean cost − cost at the solution) / mean cost: 0 = textureless, depth unconstrained by the images");
-        ui.add(egui::Slider::new(&mut o.point_size, 0.5..=5.0).text("point size px"));
-        ui.checkbox(&mut o.raw_argmin, "show raw arg min instead of regularised");
-        ui.checkbox(&mut o.color_by_keyframe, "color by keyframe");
-        ui.checkbox(&mut o.show_frustums, "keyframe frustums");
-        ui.checkbox(&mut o.show_path, "camera path");
+        self.scene.options_ui(ui);
     }
 
     fn klt_inspector(&mut self, ui: &mut egui::Ui, s: &Session) {

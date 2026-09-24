@@ -1,6 +1,4 @@
-mod app;
-mod ar;
-mod scene3d;
+use dtam_viewer::app;
 
 #[cfg(not(target_arch = "wasm32"))]
 fn main() -> eframe::Result {

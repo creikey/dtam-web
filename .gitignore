@@ -36,3 +36,5 @@ build/
 *.mp4
 *.mkv
 !test_video.mp4
+# Demo clip for the web app (512x512, short GOP), built by web/build.sh
+!web/demo.mp4

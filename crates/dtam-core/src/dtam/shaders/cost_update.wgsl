@@ -44,16 +44,26 @@ fn cs_main(@builtin(global_invocation_id) id: vec3u) {
     let u = vec3f(f32(id.x), f32(id.y), 1.0);
     let a = vec3f(dot(xf.m0.xyz, u), dot(xf.m1.xyz, u), dot(xf.m2.xyz, u));
     let maxc = vec2f(f32(p.w - 1u), f32(p.h - 1u));
+    // Eq. 2 averages every depth sample of a pixel over the same frames I(r).
+    // A frame only joins a pixel's row if the whole epipolar segment
+    // [xi_min, xi_max] lands in it (the image is convex, so checking both ends
+    // suffices); otherwise near samples, which leave the image first, would be
+    // averaged over only the frames closest to the reference view and look
+    // spuriously good.
+    let q0 = a + p.xi_min * xf.b.xyz;
+    let q1 = a + (p.xi_min + f32(p.layers - 1u) * p.xi_step) * xf.b.xyz;
+    if (q0.z <= 1e-6 || q1.z <= 1e-6) {
+        return;
+    }
+    let e0 = q0.xy / q0.z;
+    let e1 = q1.xy / q1.z;
+    if (any(min(e0, e1) < vec2f(0.0)) || any(max(e0, e1) > maxc)) {
+        return;
+    }
     for (var k = 0u; k < p.layers; k++) {
         let xi = p.xi_min + f32(k) * p.xi_step;
         let q = a + xi * xf.b.xyz;
-        if (q.z <= 1e-6) {
-            continue;
-        }
-        let uv = q.xy / q.z;
-        if (any(uv < vec2f(0.0)) || any(uv > maxc)) {
-            continue;
-        }
+        let uv = clamp(q.xy / q.z, vec2f(0.0), maxc);
         let c = bilinear(uv);
         let d = abs(ir - c);
         vol_sum[k * n + i] += d.x + d.y + d.z;

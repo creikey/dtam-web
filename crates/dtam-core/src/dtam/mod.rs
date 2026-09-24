@@ -35,8 +35,14 @@ pub struct DtamParams {
     /// Chambolle-Pock acceleration of the steps for the (1/theta)-strongly
     /// convex primal ([3] Alg. 2).
     pub accelerate: bool,
-    /// Voxels observed by fewer frames are treated as unobserved.
+    /// Pixels whose cost minimum is wider than this many layers (not
+    /// localisable, paper Fig. 2 (a)) start from an interpolation of their
+    /// localised neighbours instead of the arg min.
+    pub init_max_trough: f32,
+    /// Voxels observed by fewer frames are treated as unobserved,
     pub min_voxel_views: u32,
+    /// as are voxels observed by less than this fraction of the keyframe's frames.
+    pub min_view_fraction: f32,
     /// Pyramid levels for tracking (level 0 = mapping resolution).
     pub track_levels: u32,
     /// Gauss-Newton iterations per level, coarsest first. 0 skips 6DOF on
@@ -71,6 +77,8 @@ impl Default for DtamParams {
             sigma_d: 0.25,
             accelerate: false,
             min_voxel_views: 3,
+            min_view_fraction: 0.0,
+            init_max_trough: 6.0,
             track_levels: 4,
             track_iterations: vec![20, 20, 15, 10],
             track_thresholds: vec![0.25, 0.18, 0.12, 0.09],
@@ -172,9 +180,11 @@ impl Dtam {
         }
     }
 
-    /// (Re-)solves the active keyframe and puts it into / refreshes it in the
-    /// model used for tracking.
-    pub async fn solve_keyframe(&mut self) -> Option<Arc<Keyframe>> {
+    /// (Re-)solves the active keyframe. It joins the model used for tracking
+    /// only once its cost volume holds `min_frames` frames (paper §2.2: "We
+    /// make each keyframe available for use in pose estimation after initial
+    /// solution convergence"); until then it is returned for display only.
+    pub async fn solve_keyframe(&mut self, min_frames: usize) -> Option<Arc<Keyframe>> {
         let akf = self.active.as_mut()?;
         let built = self.mapper.solve(&self.gpu, &self.params, akf).await;
         let id = self.active_id.unwrap_or(self.keyframes.len());
@@ -184,13 +194,19 @@ impl Dtam {
                 self.keyframes[id] = kf.clone();
                 self.tracker.update_model_keyframe(id, kf.clone());
             }
-            None => {
+            None if akf.frames_used >= min_frames || self.keyframes.is_empty() => {
                 self.tracker.add_model_keyframe(&self.gpu, kf.clone(), akf.depth.clone(), akf.rgb.clone());
                 self.keyframes.push(kf.clone());
                 self.active_id = Some(id);
             }
+            None => {}
         }
         Some(kf)
+    }
+
+    /// Whether the active keyframe is already part of the tracking model.
+    pub fn active_published(&self) -> bool {
+        self.active.is_none() || self.active_id.is_some()
     }
 
     /// Builds a keyframe in one go from `frames` (image, `T_wm`) and adds it
@@ -208,7 +224,7 @@ impl Dtam {
         for (f, p) in frames {
             self.add_to_keyframe(f, *p);
         }
-        self.solve_keyframe().await.unwrap()
+        self.solve_keyframe(0).await.unwrap()
     }
 
     /// Renders the model into a virtual camera at `t_wv`.

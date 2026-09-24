@@ -594,9 +594,13 @@ dependencies = [
  "dtam-video",
  "eframe",
  "env_logger",
+ "js-sys",
  "log",
  "nalgebra",
  "pollster 0.4.0",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
  "wgpu",
 ]
 

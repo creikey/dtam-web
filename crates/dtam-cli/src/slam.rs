@@ -6,7 +6,7 @@
 use std::io::Write;
 use std::path::PathBuf;
 
-use dtam_core::slam::{PoseSource, SlamEvent, SlamParams, run};
+use dtam_core::slam::{PoseSource, Slam, SlamEvent, SlamParams};
 use dtam_core::{Gpu, SlamPipeline, TrackerParams};
 
 fn main() {
@@ -21,10 +21,13 @@ fn run_cli() -> Result<(), String> {
     let mut ply = None;
     let mut dump: Option<PathBuf> = None;
     let mut max_frames = usize::MAX;
+    let mut max_dim = 512u32;
     let mut dump_every = 50usize;
     let mut kf_window: Option<(usize, usize)> = None;
     let mut boot_frames: Option<usize> = None;
-    let mut first_kf: Option<usize> = None;
+    let mut legacy_kf = false;
+    let mut publish_after: Option<usize> = None;
+    let mut seed_limit: Option<(f64, f64)> = None;
     let mut compare: Option<usize> = None;
     let mut segment: Option<(usize, usize)> = None;
     let mut coverage: Option<f32> = None;
@@ -33,6 +36,7 @@ fn run_cli() -> Result<(), String> {
     let mut focal: Option<f64> = None;
     let mut render_ar: Option<(PathBuf, usize)> = None;
     let mut ref_seg: Option<(usize, usize)> = None;
+    let mut render_3d: Option<PathBuf> = None;
     let mut track_iters: Option<Vec<u32>> = None;
     let mut min_used: Option<f32> = None;
     let mut args = std::env::args().skip(1);
@@ -47,7 +51,7 @@ fn run_cli() -> Result<(), String> {
                 kf_window = Some((a.parse().map_err(|_| "bad")?, b.parse().map_err(|_| "bad")?));
             }
             "--bootstrap-frames" => boot_frames = args.next().and_then(|v| v.parse().ok()),
-            "--first-kf" => first_kf = args.next().and_then(|v| v.parse().ok()),
+            "--max-dim" => max_dim = args.next().and_then(|v| v.parse().ok()).ok_or("--max-dim N")?,
             "--compare" => compare = args.next().and_then(|v| v.parse().ok()),
             "--segment" => {
                 let v = args.next().ok_or("--segment A,B")?;
@@ -74,20 +78,29 @@ fn run_cli() -> Result<(), String> {
                 ref_seg = Some((a.parse().map_err(|_| "bad")?, b.parse().map_err(|_| "bad")?));
             }
             "--track-iters" => track_iters = Some(args.next().ok_or("--track-iters a,b,c,d")?.split(',').map(|v| v.parse().unwrap_or(0)).collect()),
+            "--render-3d" => render_3d = Some(PathBuf::from(args.next().ok_or("--render-3d DIR")?)),
+            "--legacy-kf" => legacy_kf = true,
+            "--publish-after" => publish_after = args.next().and_then(|v| v.parse().ok()),
+            "--seed-limit" => {
+                let v = args.next().ok_or("--seed-limit B,DEG")?;
+                let (a, b) = v.split_once(',').ok_or("--seed-limit B,DEG")?;
+                seed_limit = Some((a.parse().map_err(|_| "bad")?, b.parse().map_err(|_| "bad")?));
+            }
             "--frames" => max_frames = args.next().and_then(|v| v.parse().ok()).ok_or("--frames N")?,
             _ => video = a.into(),
         }
     }
 
     let info = dtam_video::probe(&video)?;
-    let (w, h) = (info.width, info.height);
+    // The pipeline runs on the video scaled to `max_dim` (512 like the web app).
+    let (w, h) = dtam_video::scaled_size(&info, max_dim);
     let gpu = pollster::block_on(Gpu::headless())?;
     let mut klt = SlamPipeline::new(gpu.clone(), w, h, TrackerParams::default());
     let (mut tracks, mut small) = (Vec::new(), Vec::new());
     let t0 = std::time::Instant::now();
     dtam_video::decode(&video, (w, h), |frame| {
         tracks.push(pollster::block_on(klt.process(&frame)).tracks);
-        small.push(frame.downsample2());
+        small.push(frame);
         tracks.len() < max_frames
     })?;
     eprintln!("tracked {} frames at {w}x{h} in {:.1}s", tracks.len(), t0.elapsed().as_secs_f32());
@@ -104,8 +117,10 @@ fn run_cli() -> Result<(), String> {
     if let Some(m) = min_used { params.min_used_for_mapping = m; }
     if let Some((b, a)) = nearby { params.max_keyframe_baseline = b; params.max_keyframe_angle_deg = a; }
     if let Some(c) = coverage { params.new_keyframe_coverage = c; }
-    if let Some(f) = first_kf { params.first_keyframe = Some(f); }
-    if let Some(b) = boot_frames { params.bootstrap.max_frames = b; }
+    if let Some(b) = boot_frames { params.bootstrap_window = b; }
+    if let Some(p) = publish_after { params.publish_after_frames = p; }
+    if let Some((b, a)) = seed_limit { params.seed_max_baseline = b; params.seed_max_angle_deg = a; }
+    if legacy_kf { params.publish_after_frames = 0; params.seed_max_baseline = f64::INFINITY; params.seed_max_angle_deg = f64::INFINITY; }
     if let Some(v) = kf_window { params.keyframe_frames_before = v.0; params.keyframe_frames_after = v.1; }
     if let Some((a, b)) = ref_seg {
         let f0 = dtam_core::calib::estimate_focal(&tracks, w, h, &Default::default()).map(|e| e.focal_px).unwrap_or(1400.0);
@@ -114,13 +129,8 @@ fn run_cli() -> Result<(), String> {
         eprintln!("reference BA {a}..{b}: rms {:.3} px, f {:.1}", seg.rms_reprojection_px, seg.intrinsics.fx);
         params.debug_reference = Some((a, seg.poses));
     }
-    pollster::block_on(run(
-        gpu,
-        &tracks,
-        (w, h),
-        |i| small[i].clone(),
-        &params,
-        |ev| match ev {
+    let mut slam = Slam::new(gpu, (w, h), params);
+    let mut handler = |ev: SlamEvent| match ev {
             SlamEvent::Stage(s) => eprintln!("[{:6.1}s] {s}", t0.elapsed().as_secs_f32()),
             SlamEvent::Intrinsics { self_calibrated, refined, mapping } => { intrinsics = Some(refined); eprintln!(
                 "intrinsics: self-calibrated f = {self_calibrated:.1}px, bundle-adjusted f = {:.1}px ({:.2}° HFOV), mapping {}x{} f = {:.1}px",
@@ -186,8 +196,13 @@ fn run_cli() -> Result<(), String> {
                     keyframes.push(kf);
                 }
             }
-        },
-    ))?;
+            SlamEvent::Phase(_) | SlamEvent::Klt { .. } => {}
+    };
+    for fr in &small {
+        pollster::block_on(slam.push(fr, &mut handler));
+    }
+    pollster::block_on(slam.finish(&mut handler));
+    drop(handler);
 
     let count = |s: PoseSource| sources.iter().filter(|x| x.is_some_and(|(src, _)| src == s)).count();
     println!(
@@ -287,6 +302,36 @@ fn run_cli() -> Result<(), String> {
             out.write_all(&img.rgb).map_err(|e| e.to_string())?;
         }
         println!("wrote AR frames to {}", dir.display());
+    }
+
+    // Headless renders of the dense model as meshes.
+    if let Some(dir) = render_3d {
+        use dtam_core::viz::{MeshOptions, OrbitCamera, Shading, render_image};
+        std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+        let gpu = pollster::block_on(Gpu::headless())?;
+        let first = keyframes.first().ok_or("no keyframes")?;
+        let base = OrbitCamera::framing(first);
+        let views = [("front", base), ("side", OrbitCamera { yaw: base.yaw + 0.6, ..base }), ("top", OrbitCamera { pitch: base.pitch + 0.5, ..base })];
+        let all: Vec<_> = keyframes.clone();
+        let one = vec![first.clone()];
+        for (set_name, set) in [("all", &all), ("kf0", &one)] {
+            for (vname, cam) in &views {
+                for (sname, shading, opts) in [
+                    ("tex", Shading::Texture, MeshOptions::default()),
+                    ("shaded", Shading::Shaded, MeshOptions::default()),
+                    ("tex_c0", Shading::Texture, MeshOptions { min_confidence: 0.0, max_oblique_deg: 85.0, ..Default::default() }),
+                    ("shaded_c0", Shading::Shaded, MeshOptions { min_confidence: 0.0, max_oblique_deg: 85.0, ..Default::default() }),
+                ] {
+                    let img = pollster::block_on(render_image(&gpu, set, &[], cam, [768, 576], shading, opts));
+                    let rgb: Vec<u8> = img.chunks_exact(4).flat_map(|p| [p[0], p[1], p[2]]).collect();
+                    let path = dir.join(format!("{set_name}_{vname}_{sname}.ppm"));
+                    let mut f = std::fs::File::create(&path).map_err(|e| e.to_string())?;
+                    write!(f, "P6\n768 576\n255\n").map_err(|e| e.to_string())?;
+                    f.write_all(&rgb).map_err(|e| e.to_string())?;
+                }
+            }
+        }
+        println!("wrote 3D renders to {}", dir.display());
     }
 
     if let Some(dir) = dump {

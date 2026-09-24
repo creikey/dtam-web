@@ -74,6 +74,7 @@ pub struct ActiveKeyframe {
     conf_bg: wgpu::BindGroup,
     conf: wgpu::Buffer,
     q: wgpu::Buffer,
+    a: wgpu::Buffer,
     pub frames_used: usize,
     pub frames_since_solve: usize,
     max_dist: f64,
@@ -170,6 +171,7 @@ impl Mapper {
             depth,
             rgb,
             q,
+            a,
             frames_used: 0,
             frames_since_solve: 0,
             max_dist: 0.0,
@@ -211,6 +213,10 @@ impl Mapper {
     pub async fn solve(&self, gpu: &Gpu, params: &DtamParams, akf: &mut ActiveKeyframe) -> Keyframe {
         let (w, h, n) = (akf.mp.w, akf.mp.h, akf.n);
         let mut mp = akf.mp;
+        // Depth samples seen by only a few of the frames would be averaged over
+        // a biased subset (near depths leave the image in most views), so they
+        // must be observed by a fair fraction of I(r) to count.
+        mp.min_count = (params.min_voxel_views as f32).max(params.min_view_fraction * akf.frames_used as f32).min(250.0) as u32;
         gpu.queue.write_buffer(&akf.params_buf, 0, bytemuck::bytes_of(&mp));
 
         // Per-pixel cost statistics, initial d = a = arg min C, weights g.
@@ -227,6 +233,15 @@ impl Mapper {
         let argmin_rb = gpu.readback("argmin_rb", n * 16);
         enc.copy_buffer_to_buffer(&akf.stats, 0, &argmin_rb, 0, n * 16);
         gpu.queue.submit([enc.finish()]);
+
+        // Initialisation: d0 = a0 = arg min C where the data term actually
+        // constrains depth; in textureless pixels (flat cost row) the arg min
+        // is noise, so start from a push-pull interpolation of the confident
+        // pixels instead and let the regulariser refine it.
+        let st0: Vec<[f32; 4]> = bytemuck::pod_collect_to_vec(&gpu.read_buffers(&[(&argmin_rb, n * 16)]).await[0]);
+        let init = fill_unconstrained(&st0, w as usize, h as usize, params.init_max_trough);
+        gpu.queue.write_buffer(&akf.depth, 0, bytemuck::cast_slice(&init));
+        gpu.queue.write_buffer(&akf.a, 0, bytemuck::cast_slice(&init));
 
         // Alternate primal-dual steps and the point-wise search while driving
         // theta to zero (paper §2.2.3 steps 1-3). The dual q starts at 0.
@@ -280,10 +295,32 @@ impl Mapper {
         enc.copy_buffer_to_buffer(&akf.depth, 0, &d_rb, 0, n * 4);
         enc.copy_buffer_to_buffer(&akf.conf, 0, &conf_rb, 0, n * 8);
         gpu.queue.submit([enc.finish()]);
-        let data = gpu.read_buffers(&[(&d_rb, n * 4), (&argmin_rb, n * 16), (&conf_rb, n * 8)]).await;
-        let cf: Vec<[f32; 2]> = bytemuck::pod_collect_to_vec(&data[2]);
+        let data = gpu.read_buffers(&[(&d_rb, n * 4), (&conf_rb, n * 8)]).await;
+        let cf: Vec<[f32; 2]> = bytemuck::pod_collect_to_vec(&data[1]);
         let inv_depth: Vec<f32> = bytemuck::pod_collect_to_vec(&data[0]);
-        let st: Vec<[f32; 4]> = bytemuck::pod_collect_to_vec(&data[1]);
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Ok(dir) = std::env::var("DTAM_COST_DUMP")
+            && std::env::var("DTAM_COST_DUMP_KF").map_or(true, |f| f == akf.frame.to_string())
+        {
+            // Debug: raw cost volume (sum f32 [layers][n], counts u8x4 [layers/4][n]).
+            let l = akf.mp.layers as u64;
+            let (sb, cb) = (gpu.readback("sum_rb", n * l * 4), gpu.readback("cnt_rb", n * l));
+            let mut enc = gpu.device.create_command_encoder(&Default::default());
+            enc.copy_buffer_to_buffer(&akf._vol_sum, 0, &sb, 0, n * l * 4);
+            enc.copy_buffer_to_buffer(&akf._vol_cnt, 0, &cb, 0, n * l);
+            gpu.queue.submit([enc.finish()]);
+            let v = gpu.read_buffers(&[(&sb, n * l * 4), (&cb, n * l)]).await;
+            let base = format!("{dir}/kf{}_{}", akf.frame, akf.frames_used);
+            let _ = std::fs::write(format!("{base}.sum"), &v[0]);
+            let _ = std::fs::write(format!("{base}.cnt"), &v[1]);
+            let _ = std::fs::write(format!("{base}.d"), bytemuck::cast_slice(&inv_depth));
+            let _ = std::fs::write(format!("{base}.rgb"), &akf.reference_rgb);
+            let _ = std::fs::write(
+                format!("{base}.txt"),
+                format!("{} {} {} {} {}", w, h, l, akf.xi_range.0, akf.xi_range.1),
+            );
+        }
+        let st = st0;
         let mut sorted: Vec<f32> = inv_depth.iter().copied().filter(|v| *v > 0.0).collect();
         sorted.sort_by(f32::total_cmp);
         let median_inv_depth =
@@ -308,4 +345,60 @@ impl Mapper {
             baseline: (akf.max_dist * median_inv_depth as f64) as f32,
         }
     }
+}
+
+/// Initial inverse depth: the cost-volume arg min where the minimum is
+/// localised (trough at most `max_width` layers wide), and a push-pull
+/// (pyramid) interpolation of those pixels everywhere else.
+fn fill_unconstrained(stats: &[[f32; 4]], w: usize, h: usize, max_width: f32) -> Vec<f32> {
+    let mut val: Vec<f32> = stats.iter().map(|s| s[2]).collect();
+    let mut wt: Vec<f32> = stats
+        .iter()
+        .map(|s| if s[3] <= max_width { 1.0 } else { 0.0 })
+        .collect();
+    if wt.iter().all(|v| *v == 0.0) {
+        return val;
+    }
+    // Pull: weighted means down a pyramid.
+    let mut levels = vec![(w, h, val.iter().zip(&wt).map(|(v, a)| v * a).collect::<Vec<f32>>(), wt.clone())];
+    while levels.last().unwrap().0 > 1 || levels.last().unwrap().1 > 1 {
+        let (pw, ph, pv, pw_) = levels.last().unwrap();
+        let (nw, nh) = (pw.div_ceil(2), ph.div_ceil(2));
+        let mut nv = vec![0.0; nw * nh];
+        let mut nwt = vec![0.0; nw * nh];
+        for y in 0..*ph {
+            for x in 0..*pw {
+                let (i, j) = (y * pw + x, (y / 2) * nw + x / 2);
+                nv[j] += pv[i];
+                nwt[j] += pw_[i];
+            }
+        }
+        levels.push((nw, nh, nv, nwt));
+    }
+    // Push: fill each level's empty pixels from the coarser level.
+    for l in (0..levels.len() - 1).rev() {
+        let (cw, _, cv, cwt) = {
+            let c = &levels[l + 1];
+            (c.0, c.1, c.2.clone(), c.3.clone())
+        };
+        let (fw, fh, fv, fwt) = &mut levels[l];
+        for y in 0..*fh {
+            for x in 0..*fw {
+                let (i, j) = (y * *fw + x, (y / 2) * cw + x / 2);
+                let coarse = if cwt[j] > 0.0 { cv[j] / cwt[j] } else { 0.0 };
+                let t = fwt[i].min(1.0);
+                let mean = if fwt[i] > 0.0 { fv[i] / fwt[i] } else { coarse };
+                let v = t * mean + (1.0 - t) * coarse;
+                fv[i] = v;
+                fwt[i] = 1.0;
+            }
+        }
+    }
+    for (i, v) in val.iter_mut().enumerate() {
+        if wt[i] == 0.0 {
+            *v = levels[0].2[i];
+        }
+    }
+    wt.clear();
+    val
 }
