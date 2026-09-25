@@ -156,7 +156,7 @@ DTAM.chapter({
     H(String.raw`
       <style>
         #bootstrap .mini { font-size: 14px; color: var(--muted); }
-        #bootstrap table.plain { border-collapse: collapse; font-size: 14.5px; margin: 8px 0; width: 100%; }
+        #bootstrap table.plain { border-collapse: collapse; font-size: 14.5px; margin: 8px auto; width: 100%; }
         #bootstrap table.plain td, #bootstrap table.plain th { border-bottom: 1px solid var(--line); padding: 4px 6px; text-align: left; vertical-align: top; }
       </style>
       <p>Dense tracking (chapter 11) needs a 3D model. Dense mapping (chapters 8–10) needs camera poses. At the very start we have neither. The paper breaks this deadlock with "standard point feature based stereo": use a few hundred tracked corners (chapter 6) to recover the first camera poses, then hand over to the dense machinery.</p>
