@@ -207,6 +207,25 @@ impl LiveApp {
     }
 }
 
+fn now_ms() -> f64 {
+    web_sys::window().and_then(|w| w.performance()).map_or(0.0, |p| p.now())
+}
+
+/// Per-stage wall time (ms) accumulated over frames, logged periodically.
+#[derive(Default)]
+struct Timing {
+    seek: f64,
+    grab: f64,
+    thumb: f64,
+    push: f64,
+    yield_: f64,
+    frames: u32,
+}
+
+thread_local! {
+    static UI_MS: std::cell::Cell<(f64, u32)> = const { std::cell::Cell::new((0.0, 0)) };
+}
+
 /// The processing loop: grab a frame, push it through SLAM, repeat.
 async fn run(
     state: Rc<RefCell<State>>,
@@ -231,7 +250,9 @@ async fn run(
     let demo_frames = (capture.duration() * DEMO_FPS).floor() as usize;
     let mut last_time = js_sys::Date::now();
     let mut i = 0usize;
+    let mut tm = Timing::default();
     loop {
+        let t0 = now_ms();
         if !alive(&state) {
             return Ok(());
         }
@@ -241,20 +262,28 @@ async fn run(
                     break;
                 }
                 capture.seek((i as f64 + 0.5) / DEMO_FPS).await;
-                capture.grab()?
+                let t1 = now_ms();
+                tm.seek += t1 - t0;
+                let f = capture.grab()?;
+                tm.grab += now_ms() - t1;
+                f
             }
             Source::Webcam => {
                 if i >= budget.max_frames {
                     state.borrow_mut().stage = "frame limit reached".into();
                     break;
                 }
-                capture.grab()?
+                let f = capture.grab()?;
+                tm.grab += now_ms() - t0;
+                f
             }
         };
         if !alive(&state) {
             return Ok(());
         }
+        let t1 = now_ms();
         let thumb = (i < budget.max_thumbs).then(|| thumbnail(&frame, budget.thumb));
+        tm.thumb += now_ms() - t1;
         {
             let mut s = state.borrow_mut();
             s.pending_klt = None;
@@ -271,6 +300,7 @@ async fn run(
             );
         }
         let st = state.clone();
+        let t1 = now_ms();
         slam.push(&frame, &mut |ev| {
             if let SlamEvent::Stage(s) = &ev {
                 web_sys::console::log_1(&format!("stage: {s}").into());
@@ -278,6 +308,7 @@ async fn run(
             st.borrow_mut().apply(ev)
         })
         .await;
+        tm.push += now_ms() - t1;
         {
             // Commit this frame's results together.
             let mut s = state.borrow_mut();
@@ -297,7 +328,27 @@ async fn run(
         ctx.request_repaint();
         i += 1;
         // Let the browser paint.
+        let t1 = now_ms();
         sleep(0).await;
+        tm.yield_ += now_ms() - t1;
+        tm.frames += 1;
+        if tm.frames == 60 {
+            let n = tm.frames as f64;
+            let (ui_ms, ui_n) = UI_MS.with(|c| c.replace((0.0, 0)));
+            web_sys::console::log_1(
+                &format!(
+                    "timing/frame: seek {:.1} grab {:.1} thumb {:.1} slam {:.1} yield {:.1} ms | ui {:.1} ms x {ui_n}",
+                    tm.seek / n,
+                    tm.grab / n,
+                    tm.thumb / n,
+                    tm.push / n,
+                    tm.yield_ / n,
+                    ui_ms / ui_n.max(1) as f64
+                )
+                .into(),
+            );
+            tm = Timing::default();
+        }
     }
     if alive(&state) {
         let st = state.clone();
@@ -359,6 +410,7 @@ fn panel(ui: &mut egui::Ui, title: &str, subtitle: &str, add: impl FnOnce(&mut e
 
 impl eframe::App for LiveApp {
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
+        let ui_t0 = now_ms();
         let ctx = ui.ctx().clone();
         egui::Panel::top("top").show(ui, |ui| self.top_bar(ui, &ctx));
         let finished = self.state.borrow().finished;
@@ -371,6 +423,11 @@ impl eframe::App for LiveApp {
         if self.state.borrow().running {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
+        let dt = now_ms() - ui_t0;
+        UI_MS.with(|c| {
+            let (t, n) = c.get();
+            c.set((t + dt, n + 1));
+        });
     }
 }
 

@@ -251,4 +251,9 @@ impl Dtam {
     pub async fn align(&mut self, slot: usize, prediction: &Prediction, want_mask: bool) -> (Se3, TrackStats) {
         self.tracker.align(&self.gpu, &self.params, slot, prediction, want_mask).await
     }
+
+    /// `predict` + `align` with a single GPU->CPU round trip.
+    pub async fn predict_align(&mut self, slot: usize, t_wv: Se3, want_mask: bool) -> (Prediction, Se3, TrackStats) {
+        self.tracker.predict_align(&self.gpu, &self.params, slot, t_wv, want_mask).await
+    }
 }

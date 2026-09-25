@@ -4,7 +4,8 @@
 
 @group(0) @binding(0) var<uniform> p: TrackParams;
 @group(0) @binding(1) var<storage, read> tgt: array<f32>; // live pyramid (both slots)
-@group(0) @binding(2) var<storage, read_write> partials: array<f32>;
+@group(0) @binding(2) var<storage, read_write> partials: array<vec4f>;
+@group(0) @binding(6) var<storage, read> st: GnState;
 
 @compute @workgroup_size(64)
 fn cs_main(
@@ -12,11 +13,11 @@ fn cs_main(
     @builtin(workgroup_id) wid: vec3u,
     @builtin(num_workgroups) nwg: vec3u,
 ) {
-    var acc: array<f32, NACC>;
+    var acc: array<vec4f, 9>;
     let w = p.dims.x;
     let h = p.dims.y;
-    let npx = w * h;
-    let t = mat4x4f(p.t0, p.t1, p.t2, p.t3);
+    let npx = select(w * h, 0u, st.done != 0u);
+    let t = st.cand;
     let maxc = vec2f(f32(w) - 2.0, f32(h) - 2.0);
     for (var pi = wid.x * WG + lid; pi < npx; pi += nwg.x * WG) {
         let x = pi % w;
@@ -30,25 +31,19 @@ fn cs_main(
         if (any(uv < vec2f(1.0)) || any(uv > maxc)) {
             continue;
         }
-        acc[29] += 1.0;
+        acc[7].y += 1.0;
         let r = sample_tgt(uv) - tgt[p.dims.w + pi];
         if (abs(r) > p.misc.x) {
-            acc[28] += 1.0;
+            acc[7].x += 1.0;
             continue;
         }
         let a = image_jacobian(uv, xk);
         let j = cross(xk, a);
-        acc[0] += j.x * j.x;
-        acc[1] += j.x * j.y;
-        acc[2] += j.x * j.z;
-        acc[3] += j.y * j.y;
-        acc[4] += j.y * j.z;
-        acc[5] += j.z * j.z;
-        acc[21] += j.x * r;
-        acc[22] += j.y * r;
-        acc[23] += j.z * r;
-        acc[27] += r * r;
-        acc[30] += 1.0;
+        acc[0] += j.x * vec4f(j.x, j.y, j.z, 0.0) + vec4f(0.0, 0.0, 0.0, j.y * j.y);
+        acc[1] += vec4f(j.y * j.z, j.z * j.z, 0.0, 0.0);
+        acc[5] += vec4f(0.0, j.x * r, j.y * r, j.z * r);
+        acc[6].w += r * r;
+        acc[7].z += 1.0;
     }
     reduce_and_store(acc, lid, wid.x);
 }

@@ -243,7 +243,19 @@ impl Slam {
                     self.try_bootstrap(emit).await;
                 }
             }
-            Phase::Dense | Phase::Lost => self.track(f, &small, emit).await,
+            Phase::Dense | Phase::Lost => {
+                #[cfg(not(target_arch = "wasm32"))]
+                let (t0, r0) = (std::time::Instant::now(), crate::gpu::READBACKS.load(std::sync::atomic::Ordering::Relaxed));
+                self.track(f, &small, emit).await;
+                #[cfg(not(target_arch = "wasm32"))]
+                if std::env::var_os("DTAM_PROFILE").is_some() {
+                    eprintln!(
+                        "prof {f}: {:.2} ms, {} readbacks",
+                        t0.elapsed().as_secs_f64() * 1e3,
+                        crate::gpu::READBACKS.load(std::sync::atomic::Ordering::Relaxed) - r0
+                    );
+                }
+            }
         }
 
         // Bound memory: keep only frames still needed for keyframe seeding
@@ -356,7 +368,13 @@ impl Slam {
         dtam.set_live(live, slot);
         let prev = self.poses[f - 1].unwrap_or(self.last_good);
         // Rotation pre-alignment against the previous frame (in the other slot).
+        #[cfg(not(target_arch = "wasm32"))]
+        let t_rot = std::time::Instant::now();
         let r_cur_prev = dtam.rotation(1 - slot, slot).await;
+        #[cfg(not(target_arch = "wasm32"))]
+        let t_rot = t_rot.elapsed().as_secs_f64() * 1e3;
+        #[cfg(not(target_arch = "wasm32"))]
+        let t_align = std::time::Instant::now();
         let prev2 = if f >= 2 { self.poses[f - 2].unwrap_or(prev) } else { prev };
         let velocity = prev2.inverse().compose(&prev);
         let predicted = prev.compose(&Se3::new(r_cur_prev.transpose(), velocity.t));
@@ -369,14 +387,11 @@ impl Slam {
         let mut result: Option<(Se3, TrackStats)> = None;
         let mut attempt = 0;
         while attempt < candidates.len() {
-            let pred = dtam.predict(candidates[attempt]).await;
-            if pred.coverage >= 0.02 {
-                let (pose, stats) = dtam.align(slot, &pred, true).await;
-                if tracking_ok(&stats) {
-                    prediction = Some(pred);
-                    result = Some((pose, stats));
-                    break;
-                }
+            let (pred, pose, stats) = dtam.predict_align(slot, candidates[attempt], true).await;
+            if pred.coverage >= 0.02 && tracking_ok(&stats) {
+                prediction = Some(pred);
+                result = Some((pose, stats));
+                break;
             }
             if attempt == 0 {
                 candidates.push(self.last_good);
@@ -385,6 +400,10 @@ impl Slam {
             attempt += 1;
         }
         let prediction = prediction.unwrap();
+        #[cfg(not(target_arch = "wasm32"))]
+        if std::env::var_os("DTAM_PROFILE").is_some() {
+            eprintln!("stage {f}: rotation {t_rot:.2} ms, predict+align {:.2} ms", t_align.elapsed().as_secs_f64() * 1e3);
+        }
         let (pose, source, stats) = match result {
             Some((pose, stats)) => (pose, PoseSource::Dense, stats),
             None => (predicted, PoseSource::Predicted, prediction.to_stats()),

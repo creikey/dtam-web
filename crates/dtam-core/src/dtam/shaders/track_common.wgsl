@@ -5,19 +5,10 @@
 //         31 pixels with a model prediction,
 //         32..36 photometric sums over used pixels: I_l, I_v, I_l^2, I_l I_v.
 
-struct TrackParams {
-    t0: vec4f, // transform, column-major
-    t1: vec4f,
-    t2: vec4f,
-    t3: vec4f,
-    k: vec4f,     // fx fy cx cy at this level
-    dims: vec4u,  // w, h, target offset, template offset
-    misc: vec4f,  // outlier threshold, write mask (0/1), gain, bias
-}
-
 const WG: u32 = 64u;
-const NACC: u32 = 36u;
-var<workgroup> sh: array<f32, 2304>; // WG * NACC
+// Accumulators as 9 vec4s (indices 4k..4k+3), kept in registers with
+// constant indexing; reduced through workgroup memory laid out [k][lid].
+var<workgroup> sh: array<vec4f, 576>; // 9 * WG
 
 fn tgt_at(x: u32, y: u32) -> f32 {
     return tgt[p.dims.z + y * p.dims.x + x];
@@ -41,22 +32,20 @@ fn image_jacobian(uv: vec2f, x: vec3f) -> vec3f {
     return vec3f(gx * p.k.x * iz, gy * p.k.y * iz, -(gx * p.k.x * x.x + gy * p.k.y * x.y) * iz * iz);
 }
 
-fn reduce_and_store(acc: array<f32, NACC>, lid: u32, wid: u32) {
-    for (var k = 0u; k < NACC; k++) {
-        sh[lid * NACC + k] = acc[k];
+fn reduce_and_store(acc: array<vec4f, 9>, lid: u32, wid: u32) {
+    for (var k = 0u; k < 9u; k++) {
+        sh[k * WG + lid] = acc[k];
     }
     workgroupBarrier();
     for (var s = WG / 2u; s > 0u; s >>= 1u) {
         if (lid < s) {
-            for (var k = 0u; k < NACC; k++) {
-                sh[lid * NACC + k] += sh[(lid + s) * NACC + k];
+            for (var k = 0u; k < 9u; k++) {
+                sh[k * WG + lid] += sh[k * WG + lid + s];
             }
         }
         workgroupBarrier();
     }
-    if (lid == 0u) {
-        for (var k = 0u; k < NACC; k++) {
-            partials[wid * NACC + k] = sh[k];
-        }
+    if (lid < 9u) {
+        partials[wid * 9u + lid] = sh[lid * WG];
     }
 }

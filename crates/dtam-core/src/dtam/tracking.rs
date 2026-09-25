@@ -6,7 +6,6 @@
 use std::sync::Arc;
 
 use bytemuck::{Pod, Zeroable};
-use nalgebra::{Matrix3, Matrix6, Vector3, Vector6};
 
 use super::{DtamParams, Keyframe};
 use crate::geom::{Intrinsics, Mat3, Se3, Vec3};
@@ -48,6 +47,44 @@ struct TrackParams {
     k: [f32; 4],
     dims: [u32; 4],
     misc: [f32; 4],
+}
+
+/// Mirror of `GnState` in track_types.wgsl.
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct GnState {
+    cand: [[f32; 4]; 4],
+    pose: [[f32; 4]; 4],
+    sums: [f32; 32],
+    sums_hi: [f32; 4],
+    best: f32,
+    damping: f32,
+    gain: f32,
+    bias: f32,
+    done: u32,
+    has_acc: u32,
+    iters: u32,
+    _pad: u32,
+}
+
+impl GnState {
+    fn start(t: &Se3, (gain, bias): (f32, f32)) -> Self {
+        let m = t.to_mat4_f32();
+        Self { cand: m, pose: m, gain, bias, damping: 1e-4, ..Self::zeroed() }
+    }
+
+    fn sums(&self) -> [f64; NACC as usize] {
+        let mut out = [0f64; NACC as usize];
+        for (o, v) in out.iter_mut().zip(self.sums.iter().chain(&self.sums_hi)) {
+            *o = *v as f64;
+        }
+        out
+    }
+}
+
+fn se3_from_mat4(m: &[[f32; 4]; 4]) -> Se3 {
+    let r = Mat3::from_fn(|i, j| m[j][i] as f64);
+    Se3::new(crate::geom::orthonormalize(&r), Vec3::new(m[3][0] as f64, m[3][1] as f64, m[3][2] as f64))
 }
 
 #[derive(Clone, Copy)]
@@ -135,6 +172,9 @@ pub struct DenseTracker {
     down: wgpu::ComputePipeline,
     track6: wgpu::ComputePipeline,
     track_rot: wgpu::ComputePipeline,
+    gn_begin: wgpu::ComputePipeline,
+    gn_step6: wgpu::ComputePipeline,
+    gn_step_rot: wgpu::ComputePipeline,
     render: wgpu::RenderPipeline,
 
     live_rgba: wgpu::Buffer,
@@ -151,7 +191,15 @@ pub struct DenseTracker {
     live_bgs: [(wgpu::BindGroup, Vec<wgpu::BindGroup>); 2],
     pred_down_bgs: Vec<(wgpu::BindGroup, wgpu::BindGroup)>,
     track6_bg: wgpu::BindGroup,
-    rot_bg: wgpu::BindGroup,
+    gn_state: wgpu::Buffer,
+    gn_rb: wgpu::Buffer,
+    gn_begin_bg: wgpu::BindGroup,
+    /// Per pyramid level: (uniform, residual pass bind group, solver bind group)
+    /// for the 6DOF alignment and for the rotation pre-alignment.
+    level6: Vec<(wgpu::Buffer, wgpu::BindGroup, wgpu::BindGroup)>,
+    level_rot: Vec<(wgpu::Buffer, wgpu::BindGroup, wgpu::BindGroup)>,
+    mask_params: wgpu::Buffer,
+    mask_bg: wgpu::BindGroup,
 
     luma_tex: wgpu::Texture,
     depth_tex: wgpu::Texture,
@@ -179,8 +227,13 @@ impl DenseTracker {
         let common = include_str!("shaders/track_common.wgsl");
         let unpack = gpu.compute_pipeline_entry("unpack", pyr_src, "unpack");
         let down = gpu.compute_pipeline_entry("down", pyr_src, "down");
-        let track6 = gpu.compute_pipeline("track6", &[common, include_str!("shaders/track6.wgsl")].concat());
-        let track_rot = gpu.compute_pipeline("track_rot", &[common, include_str!("shaders/track_rot.wgsl")].concat());
+        let types = include_str!("shaders/track_types.wgsl");
+        let track6 = gpu.compute_pipeline("track6", &[types, common, include_str!("shaders/track6.wgsl")].concat());
+        let track_rot = gpu.compute_pipeline("track_rot", &[types, common, include_str!("shaders/track_rot.wgsl")].concat());
+        let gn_src = [types, include_str!("shaders/gn.wgsl")].concat();
+        let gn_begin = gpu.compute_pipeline_entry("gn_begin", &gn_src, "begin");
+        let gn_step6 = gpu.compute_pipeline_entry("gn_step6", &gn_src, "step6");
+        let gn_step_rot = gpu.compute_pipeline_entry("gn_step_rot", &gn_src, "step_rot");
 
         let module = gpu.device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("predict"),
@@ -271,8 +324,36 @@ impl DenseTracker {
                 )
             })
             .collect();
-        let track6_bg = gpu.bind_group(&track6, &[&track_params, &live_pyr, &pred_luma, &pred_depth, &partials, &mask]);
-        let rot_bg = gpu.bind_group(&track_rot, &[&track_params, &live_pyr, &partials]);
+        let gn_state = gpu.storage("gn_state", std::mem::size_of::<GnState>() as u64, rw);
+        let gn_rb = gpu.readback("gn_rb", std::mem::size_of::<GnState>() as u64);
+        let track6_bind = |u: &wgpu::Buffer| {
+            bind_at(
+                gpu,
+                &track6,
+                &[(0, u), (1, &live_pyr), (2, &pred_luma), (3, &pred_depth), (4, &partials), (5, &mask), (6, &gn_state)],
+            )
+        };
+        let track6_bg = track6_bind(&track_params);
+        let gn_begin_bg = bind_at(gpu, &gn_begin, &[(6, &gn_state)]);
+        let level6 = levels
+            .iter()
+            .map(|_| {
+                let u = gpu.uniform("track_level", &TrackParams::zeroed());
+                let (a, b) = (track6_bind(&u), bind_at(gpu, &gn_step6, &[(0, &u), (4, &partials), (6, &gn_state)]));
+                (u, a, b)
+            })
+            .collect();
+        let level_rot = levels
+            .iter()
+            .map(|_| {
+                let u = gpu.uniform("rot_level", &TrackParams::zeroed());
+                let a = bind_at(gpu, &track_rot, &[(0, &u), (1, &live_pyr), (2, &partials), (6, &gn_state)]);
+                let b = bind_at(gpu, &gn_step_rot, &[(4, &partials), (6, &gn_state)]);
+                (u, a, b)
+            })
+            .collect();
+        let mask_params = gpu.uniform("mask_params", &TrackParams::zeroed());
+        let mask_bg = track6_bind(&mask_params);
 
         let tex = |label: &str, format: wgpu::TextureFormat, usage: wgpu::TextureUsages| {
             gpu.device.create_texture(&wgpu::TextureDescriptor {
@@ -296,6 +377,9 @@ impl DenseTracker {
             down,
             track6,
             track_rot,
+            gn_begin,
+            gn_step6,
+            gn_step_rot,
             render,
             live_rgba,
             _live_pyr: live_pyr,
@@ -310,7 +394,13 @@ impl DenseTracker {
             live_bgs,
             pred_down_bgs,
             track6_bg,
-            rot_bg,
+            gn_state,
+            gn_rb,
+            gn_begin_bg,
+            level6,
+            level_rot,
+            mask_params,
+            mask_bg,
             luma_tex: tex("pred_luma_tex", wgpu::TextureFormat::R32Float, color_usage),
             depth_tex: tex("pred_depth_tex", wgpu::TextureFormat::R32Float, color_usage),
             zbuf: tex("pred_z", wgpu::TextureFormat::Depth32Float, wgpu::TextureUsages::RENDER_ATTACHMENT),
@@ -382,6 +472,19 @@ impl DenseTracker {
 
     /// Renders every keyframe into the virtual camera `t_wv`.
     pub async fn predict(&mut self, gpu: &Gpu, t_wv: Se3) -> Prediction {
+        self.submit_predict(gpu, t_wv);
+        let data = gpu.read_buffers(&[(&self.preview_rb, self.preview_bytes())]).await;
+        self.finish_predict(t_wv, &data[0])
+    }
+
+    fn preview_bytes(&self) -> u64 {
+        let l1 = self.levels[1.min(self.levels.len() - 1)];
+        (l1.w * l1.h * 8) as u64
+    }
+
+    /// Renders the model at `t_wv` and queues the level-1 preview copy into
+    /// `preview_rb` (read back by the caller).
+    fn submit_predict(&mut self, gpu: &Gpu, t_wv: Se3) {
         let k = self.k;
         let t_vw = t_wv.inverse();
         for m in &self.model {
@@ -450,8 +553,11 @@ impl DenseTracker {
         enc.copy_buffer_to_buffer(&self.pred_luma, l1.off as u64 * 4, &self.preview_rb, 0, bytes);
         enc.copy_buffer_to_buffer(&self.pred_depth, l1.off as u64 * 4, &self.preview_rb, bytes, bytes);
         gpu.queue.submit([enc.finish()]);
-        let data = gpu.read_buffers(&[(&self.preview_rb, bytes * 2)]).await;
-        let all: Vec<f32> = bytemuck::pod_collect_to_vec(&data[0]);
+    }
+
+    fn finish_predict(&self, t_wv: Se3, preview: &[u8]) -> Prediction {
+        let l1 = self.levels[1.min(self.levels.len() - 1)];
+        let all: Vec<f32> = bytemuck::pod_collect_to_vec(preview);
         let (luma, depth) = all.split_at(all.len() / 2);
         let mut valid: Vec<f32> = depth.iter().copied().filter(|v| *v > 0.0).collect();
         valid.sort_by(f32::total_cmp);
@@ -488,32 +594,41 @@ impl DenseTracker {
     }
 
     /// Rotation-only alignment between consecutive live frames (§2.3.1).
+    /// All Gauss-Newton iterations run on the GPU; one readback.
     pub async fn rotation(&mut self, gpu: &Gpu, params: &DtamParams, prev_slot: usize, cur_slot: usize) -> Mat3 {
-        let mut r = Mat3::identity();
-        for &l in &params.rotation_levels {
-            let Some(lvl) = self.levels.get(l as usize).copied() else { continue };
-            let kl = self.k.level(l);
-            for _ in 0..params.rotation_iterations {
+        gpu.queue.write_buffer(&self.gn_state, 0, bytemuck::bytes_of(&GnState::start(&Se3::identity(), (1.0, 0.0))));
+        let mut enc = gpu.device.create_command_encoder(&Default::default());
+        {
+            let mut pass = enc.begin_compute_pass(&Default::default());
+            for &l in &params.rotation_levels {
+                let Some(lvl) = self.levels.get(l as usize).copied() else { continue };
+                let (u, track_bg, step_bg) = &self.level_rot[l as usize];
                 let tp = TrackParams {
-                    t: Se3::new(r, Vec3::zeros()).to_mat4_f32(),
-                    k: kl.to_f32(),
+                    t: Se3::identity().to_mat4_f32(),
+                    k: self.k.level(l).to_f32(),
                     dims: [lvl.w, lvl.h, cur_slot as u32 * self.pyr_len + lvl.off, prev_slot as u32 * self.pyr_len + lvl.off],
                     misc: [0.2, 0.0, 0.0, 0.0],
                 };
-                let s = self.run_pass(gpu, &self.track_rot, &self.rot_bg, &tp).await;
-                if s[30] < 50.0 {
-                    break;
-                }
-                let h = Matrix3::new(s[0], s[1], s[2], s[1], s[3], s[4], s[2], s[4], s[5]);
-                let b = Vector3::new(s[21], s[22], s[23]);
-                let Some(w) = h.cholesky().map(|c| -c.solve(&b)) else { break };
-                r = crate::geom::orthonormalize(&(Se3::exp_rot(&w) * r));
-                if w.norm() < 1e-6 {
-                    break;
+                gpu.queue.write_buffer(u, 0, bytemuck::bytes_of(&tp));
+                pass.set_pipeline(&self.gn_begin);
+                pass.set_bind_group(0, &self.gn_begin_bg, &[]);
+                pass.dispatch_workgroups(1, 1, 1);
+                for _ in 0..params.rotation_iterations {
+                    pass.set_pipeline(&self.track_rot);
+                    pass.set_bind_group(0, track_bg, &[]);
+                    pass.dispatch_workgroups(NWG, 1, 1);
+                    pass.set_pipeline(&self.gn_step_rot);
+                    pass.set_bind_group(0, step_bg, &[]);
+                    pass.dispatch_workgroups(1, 1, 1);
                 }
             }
         }
-        r
+        let size = std::mem::size_of::<GnState>() as u64;
+        enc.copy_buffer_to_buffer(&self.gn_state, 0, &self.gn_rb, 0, size);
+        gpu.queue.submit([enc.finish()]);
+        let data = gpu.read_buffers(&[(&self.gn_rb, size)]).await;
+        let st: GnState = bytemuck::pod_read_unaligned(&data[0]);
+        se3_from_mat4(&st.pose).r
     }
 
     /// Robust photometric cost (truncated quadratic, level 0) of the live frame
@@ -545,114 +660,124 @@ impl DenseTracker {
         pred: &Prediction,
         want_mask: bool,
     ) -> (Se3, TrackStats) {
-        let mut t_lv = Se3::identity();
-        let nlev = self.levels.len();
-        let mut stats = TrackStats { coverage: pred.coverage, ..Default::default() };
+        self.submit_align(gpu, params, slot, want_mask);
+        let (bufs, sizes) = self.align_readbacks(want_mask);
+        let reqs: Vec<_> = bufs.iter().zip(&sizes).map(|(b, s)| (*b, *s)).collect();
+        let data = gpu.read_buffers(&reqs).await;
+        self.finish_align(pred, &data[0], data.get(1).map(|v| v.as_slice()))
+    }
+
+    /// Renders the prediction at `t_wv` and aligns the live frame in `slot`
+    /// to it, with a single GPU->CPU readback for both.
+    pub async fn predict_align(
+        &mut self,
+        gpu: &Gpu,
+        params: &DtamParams,
+        slot: usize,
+        t_wv: Se3,
+        want_mask: bool,
+    ) -> (Prediction, Se3, TrackStats) {
+        self.submit_predict(gpu, t_wv);
+        self.submit_align(gpu, params, slot, want_mask);
+        let (mut bufs, mut sizes) = self.align_readbacks(want_mask);
+        bufs.push(&self.preview_rb);
+        sizes.push(self.preview_bytes());
+        let reqs: Vec<_> = bufs.iter().zip(&sizes).map(|(b, s)| (*b, *s)).collect();
+        let data = gpu.read_buffers(&reqs).await;
+        let pred = self.finish_predict(t_wv, data.last().unwrap());
+        let (pose, stats) = self.finish_align(&pred, &data[0], if want_mask { Some(&data[1]) } else { None });
+        (pred, pose, stats)
+    }
+
+    fn align_readbacks(&self, want_mask: bool) -> (Vec<&wgpu::Buffer>, Vec<u64>) {
+        let mut bufs = vec![&self.gn_rb];
+        let mut sizes = vec![std::mem::size_of::<GnState>() as u64];
         if want_mask {
-            stats.fill_prediction(pred);
+            let l = self.levels[1.min(self.levels.len() - 1)];
+            bufs.push(&self.mask_rb);
+            sizes.push((l.w * l.h * 4) as u64);
         }
-        let mut last = [0f64; NACC as usize];
-        let (mut gain, mut bias) = self.photometric;
-        for (li, l) in (0..nlev).rev().enumerate() {
-            let lvl = self.levels[l];
-            let kl = self.k.level(l as u32);
-            let iters = params.track_iterations.get(li).copied().unwrap_or(5);
-            let thresh = params.track_thresholds.get(li).copied().unwrap_or(0.1);
-            // Levenberg-Marquardt safeguard on the Gauss-Newton steps: a step is
-            // kept only if the robust (truncated-quadratic) photometric cost
-            // drops; otherwise revert and increase damping.
-            let mut accepted: Option<(Se3, f64, [f64; NACC as usize])> = None;
-            let mut damping: f64 = 1e-4;
-            let mut candidate = t_lv;
-            for _ in 0..iters {
+        (bufs, sizes)
+    }
+
+    /// Queues the whole coarse-to-fine alignment: per level, a fixed number
+    /// of (residual pass, solver step) pairs; the solver skips the remaining
+    /// iterations of a level once it has converged, like the CPU loop's
+    /// early exits.
+    fn submit_align(&mut self, gpu: &Gpu, params: &DtamParams, slot: usize, want_mask: bool) {
+        gpu.queue.write_buffer(&self.gn_state, 0, bytemuck::bytes_of(&GnState::start(&Se3::identity(), self.photometric)));
+        let nlev = self.levels.len();
+        let mut enc = gpu.device.create_command_encoder(&Default::default());
+        {
+            let mut pass = enc.begin_compute_pass(&Default::default());
+            for (li, l) in (0..nlev).rev().enumerate() {
+                let lvl = self.levels[l];
+                let (u, track_bg, step_bg) = &self.level6[l];
                 let tp = TrackParams {
-                    t: candidate.to_mat4_f32(),
-                    k: kl.to_f32(),
+                    t: Se3::identity().to_mat4_f32(),
+                    k: self.k.level(l as u32).to_f32(),
                     dims: [lvl.w, lvl.h, slot as u32 * self.pyr_len + lvl.off, lvl.off],
-                    misc: [thresh, 0.0, gain, bias],
+                    misc: [params.track_thresholds.get(li).copied().unwrap_or(0.1), 0.0, 1.0, 0.0],
                 };
-                let s = self.run_pass(gpu, &self.track6, &self.track6_bg, &tp).await;
-                stats.iterations += 1;
-                if s[29] < 100.0 || s[30] < 100.0 {
-                    break;
-                }
-                let t2 = (thresh as f64).powi(2);
-                let cost = (s[27] + s[28] * t2) / s[29];
-                let base = match &accepted {
-                    Some((_, best, _)) if cost > *best => {
-                        // Reject: back to the last accepted pose, damp harder.
-                        damping *= 10.0;
-                        if damping > 1e4 {
-                            break;
-                        }
-                        accepted.as_ref().unwrap().clone()
-                    }
-                    _ => {
-                        damping = (damping / 3.0).max(1e-7);
-                        // Closed-form gain/bias for the accepted warp.
-                        let n = s[30];
-                        let det = n * s[34] - s[32] * s[32];
-                        if n > 100.0 && det.abs() > 1e-9 {
-                            let a = ((n * s[35] - s[32] * s[33]) / det).clamp(0.5, 2.0);
-                            bias = ((s[33] - a * s[32]) / n) as f32;
-                            gain = a as f32;
-                        }
-                        accepted = Some((candidate, cost, s));
-                        (candidate, cost, s)
-                    }
-                };
-                let (pose, _, s) = base;
-                last = s;
-                t_lv = pose;
-                let mut h = Matrix6::<f64>::zeros();
-                let mut idx = 0;
-                for m in 0..6 {
-                    for n in m..6 {
-                        h[(m, n)] = s[idx];
-                        h[(n, m)] = s[idx];
-                        idx += 1;
-                    }
-                }
-                for i in 0..6 {
-                    h[(i, i)] *= 1.0 + damping;
-                }
-                let b = Vector6::from_iterator((21..27).map(|i| s[i]));
-                let Some(psi) = h.cholesky().map(|c| -c.solve(&b)) else { break };
-                candidate = t_lv.compose(&Se3::exp(&[psi[0], psi[1], psi[2], psi[3], psi[4], psi[5]]));
-                if psi.norm() < 1e-6 {
-                    break;
+                gpu.queue.write_buffer(u, 0, bytemuck::bytes_of(&tp));
+                pass.set_pipeline(&self.gn_begin);
+                pass.set_bind_group(0, &self.gn_begin_bg, &[]);
+                pass.dispatch_workgroups(1, 1, 1);
+                for _ in 0..params.track_iterations.get(li).copied().unwrap_or(5) {
+                    pass.set_pipeline(&self.track6);
+                    pass.set_bind_group(0, track_bg, &[]);
+                    pass.dispatch_workgroups(NWG, 1, 1);
+                    pass.set_pipeline(&self.gn_step6);
+                    pass.set_bind_group(0, step_bg, &[]);
+                    pass.dispatch_workgroups(1, 1, 1);
                 }
             }
-            if let Some((pose, _, s)) = accepted {
-                t_lv = pose;
-                last = s;
+            if want_mask && nlev > 1 {
+                let lvl = self.levels[1];
+                let tp = TrackParams {
+                    t: Se3::identity().to_mat4_f32(),
+                    k: self.k.level(1).to_f32(),
+                    dims: [lvl.w, lvl.h, slot as u32 * self.pyr_len + lvl.off, lvl.off],
+                    misc: [params.track_thresholds.last().copied().unwrap_or(0.1), 1.0, 1.0, 0.0],
+                };
+                gpu.queue.write_buffer(&self.mask_params, 0, bytemuck::bytes_of(&tp));
+                pass.set_pipeline(&self.track6);
+                pass.set_bind_group(0, &self.mask_bg, &[]);
+                pass.dispatch_workgroups(NWG, 1, 1);
             }
+        }
+        let size = std::mem::size_of::<GnState>() as u64;
+        enc.copy_buffer_to_buffer(&self.gn_state, 0, &self.gn_rb, 0, size);
+        if want_mask && nlev > 1 {
+            let l = self.levels[1];
+            enc.copy_buffer_to_buffer(&self.mask, 0, &self.mask_rb, 0, (l.w * l.h * 4) as u64);
+        }
+        gpu.queue.submit([enc.finish()]);
+    }
+
+    fn finish_align(&mut self, pred: &Prediction, state: &[u8], mask: Option<&[u8]>) -> (Se3, TrackStats) {
+        let st: GnState = bytemuck::pod_read_unaligned(state);
+        let last = st.sums();
+        let mut stats = TrackStats { coverage: pred.coverage, iterations: st.iters, ..Default::default() };
+        if mask.is_some() {
+            stats.fill_prediction(pred);
         }
         if last[29] > 0.0 {
             stats.rmse = (last[27] / last[30].max(1.0)).sqrt() as f32;
             stats.used_fraction = (last[30] / last[29]) as f32;
             stats.rejected_fraction = (last[28] / last[29]) as f32;
         }
-        if want_mask && nlev > 1 {
-            let lvl = self.levels[1];
-            let tp = TrackParams {
-                t: t_lv.to_mat4_f32(),
-                k: self.k.level(1).to_f32(),
-                dims: [lvl.w, lvl.h, slot as u32 * self.pyr_len + lvl.off, lvl.off],
-                misc: [params.track_thresholds.last().copied().unwrap_or(0.1), 1.0, gain, bias],
-            };
-            self.run_pass(gpu, &self.track6, &self.track6_bg, &tp).await;
-            let bytes = (lvl.w * lvl.h * 4) as u64;
-            let mut enc = gpu.device.create_command_encoder(&Default::default());
-            enc.copy_buffer_to_buffer(&self.mask, 0, &self.mask_rb, 0, bytes);
-            gpu.queue.submit([enc.finish()]);
-            let data = gpu.read_buffers(&[(&self.mask_rb, bytes)]).await;
-            let m: Vec<u32> = bytemuck::pod_collect_to_vec(&data[0]);
-            stats.mask = Some((lvl.w, lvl.h, m.into_iter().map(|v| v as u8).collect()));
+        stats.gain = st.gain;
+        stats.bias = st.bias;
+        if let (Some(m), true) = (mask, self.levels.len() > 1) {
+            let l = self.levels[1];
+            let m: Vec<u32> = bytemuck::pod_collect_to_vec(m);
+            stats.mask = Some((l.w, l.h, m.into_iter().map(|v| v as u8).collect()));
         }
         if stats.used_fraction > 0.5 {
-            self.photometric = (gain, bias);
+            self.photometric = (st.gain, st.bias);
         }
+        let t_lv = se3_from_mat4(&st.pose);
         (pred.pose.compose(&t_lv.inverse()), stats)
     }
 }

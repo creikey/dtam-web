@@ -6,6 +6,9 @@
 
 use wgpu::util::DeviceExt;
 
+/// Number of GPU->CPU round trips so far (profiling).
+pub static READBACKS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 /// A device + queue pair. Cheap to clone; the viewer shares its render device
 /// with the SLAM pipeline so everything runs on one GPU context.
 #[derive(Clone)]
@@ -50,7 +53,14 @@ impl Gpu {
             layout: None,
             module: &module,
             entry_point: Some(entry),
-            compilation_options: Default::default(),
+            // Every kernel writes its workgroup memory before reading it, so
+            // skip the zero-fill: in wgpu's native backends it is done
+            // serially and costs ~0.2 ms per dispatch of a reduction kernel
+            // (browsers always zero-fill, efficiently).
+            compilation_options: wgpu::PipelineCompilationOptions {
+                zero_initialize_workgroup_memory: false,
+                ..Default::default()
+            },
             cache: None,
         })
     }
@@ -111,6 +121,7 @@ impl Gpu {
 
     /// Maps the first `sizes[i]` bytes of each buffer and returns copies.
     pub(crate) async fn read_buffers(&self, bufs: &[(&wgpu::Buffer, u64)]) -> Vec<Vec<u8>> {
+        READBACKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let mut receivers = Vec::new();
         for (buf, size) in bufs {
             let (tx, rx) = futures_channel::oneshot::channel();
