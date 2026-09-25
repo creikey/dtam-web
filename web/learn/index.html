@@ -1,0 +1,73 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>How DTAM Works</title>
+<meta name="description" content="An interactive, from-scratch guide to Dense Tracking and Mapping (DTAM): every component and equation, with diagrams and quizzes. Written by Claude Opus 5.5.">
+<meta name="author" content="Claude Opus 5.5">
+<meta property="og:type" content="article">
+<meta property="og:url" content="https://creikey.github.io/dtam-web/learn/">
+<meta property="og:title" content="How DTAM works — an interactive guide">
+<meta property="og:description" content="Every component and equation of Dense Tracking and Mapping, from pixels to a live 3D reconstruction. Interactive diagrams and quizzes. Written by Claude Opus 5.5.">
+<meta property="og:image" content="https://creikey.github.io/dtam-web/dtam_preview.jpg">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:image" content="https://creikey.github.io/dtam-web/dtam_preview.jpg">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,600;1,8..60,400&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.css">
+<link rel="stylesheet" href="learn.css">
+<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.js"></script>
+<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/contrib/auto-render.min.js"></script>
+</head>
+<body>
+<div class="progress" role="navigation" aria-label="Progress">
+  <div class="progress-inner">
+    <a class="home" href="../">← DTAM app</a>
+    <div class="track" role="progressbar" aria-label="Guide completion"><div class="fill"></div></div>
+    <span class="stats">loading…</span>
+    <button id="reset" type="button" title="Erase saved progress">Reset</button>
+  </div>
+</div>
+<main>
+  <header class="hero">
+    <h1>How DTAM works</h1>
+    <p class="dek">Dense Tracking and Mapping, from single pixels to a live 3D model. Every part is explained so you could build it yourself.</p>
+    <div class="byline">
+      <div class="avatar" aria-hidden="true">O</div>
+      <div>Written by <b>Claude Opus 5.5</b> (Anthropic), the model that implemented the <a href="../">DTAM demo</a> in Rust + WebGPU.<br>
+        Based on Newcombe, Lovegrove &amp; Davison, <i>DTAM: Dense Tracking and Mapping in Real-Time</i>, ICCV 2011.</div>
+    </div>
+  </header>
+  <nav class="toc" aria-label="Chapters">
+    <h2>Chapters</h2>
+    <ol id="toc-list"></ol>
+  </nav>
+  <div id="chapters"></div>
+  <footer class="footer">
+    Written by Claude Opus 5.5. Progress is saved in this browser only.
+    Source: <a href="https://github.com/creikey/dtam-web">github.com/creikey/dtam-web</a>.
+  </footer>
+</main>
+<script src="core.js"></script>
+<script src="chapters/00-overview.js"></script>
+<script src="chapters/01-images.js"></script>
+<script src="chapters/02-linear-algebra.js"></script>
+<script src="chapters/03-camera.js"></script>
+<script src="chapters/04-rigid-motion.js"></script>
+<script src="chapters/05-least-squares.js"></script>
+<script src="chapters/06-klt.js"></script>
+<script src="chapters/07-bootstrap.js"></script>
+<script src="chapters/08-cost-volume.js"></script>
+<script src="chapters/09-regulariser.js"></script>
+<script src="chapters/10-primal-dual.js"></script>
+<script src="chapters/11-tracking.js"></script>
+<script src="chapters/12-system.js"></script>
+<script src="chapters/13-final-exam.js"></script>
+<script>
+  // KaTeX loads with `defer`; build once everything is in.
+  window.addEventListener("DOMContentLoaded", () => window.DTAM.build());
+</script>
+</body>
+</html>

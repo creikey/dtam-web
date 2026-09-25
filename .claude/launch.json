@@ -1,0 +1,14 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "learn",
+      "runtimeExecutable": "python3",
+      "runtimeArgs": [
+        "web/learn/tools/serve.py",
+        "8767"
+      ],
+      "port": 8767
+    }
+  ]
+}

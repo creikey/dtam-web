@@ -5,6 +5,20 @@
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>DTAM in the browser</title>
 <meta name="description" content="Dense Tracking and Mapping (Newcombe, Lovegrove & Davison 2011) in Rust + WebGPU">
+<!-- Link previews (Twitter/X, Slack, iMessage, ...): image URLs must be absolute. -->
+<meta property="og:type" content="website">
+<meta property="og:url" content="https://creikey.github.io/dtam-web/">
+<meta property="og:title" content="DTAM in the browser">
+<meta property="og:description" content="Dense Tracking and Mapping (Newcombe, Lovegrove & Davison 2011) running live in Rust + WebGPU: dense tracking, per-keyframe depth maps and a fused 3D model.">
+<meta property="og:image" content="https://creikey.github.io/dtam-web/dtam_preview.jpg">
+<meta property="og:image:width" content="1796">
+<meta property="og:image:height" content="1034">
+<meta property="og:image:alt" content="The DTAM web app: camera view with an AR cube, the fused 3D reconstruction, model prediction and keyframe depth maps">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="DTAM in the browser">
+<meta name="twitter:description" content="Dense Tracking and Mapping (Newcombe, Lovegrove & Davison 2011) running live in Rust + WebGPU.">
+<meta name="twitter:image" content="https://creikey.github.io/dtam-web/dtam_preview.jpg">
+<meta name="twitter:image:alt" content="The DTAM web app: camera view with an AR cube, the fused 3D reconstruction, model prediction and keyframe depth maps">
 <style>
   html, body { margin: 0; height: 100%; background: #111316; color: #e6e8eb; overflow: hidden;
     font: 15px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
@@ -24,6 +38,7 @@
   <h1 id="msg-title">WebGPU isn't available</h1>
   <p id="msg-body"></p>
   <p id="msg-advice"></p>
+  <p><a href="learn/" style="color:#6ea2ff">Meanwhile, read how DTAM works: an interactive guide (no WebGPU needed) →</a></p>
 </div></div>
 <script type="module">
 function advice() {

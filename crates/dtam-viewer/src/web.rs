@@ -454,6 +454,12 @@ impl LiveApp {
             } else if ui.button("↻ restart").clicked() {
                 self.start(self.source, ctx);
             }
+            ui.separator();
+            let guide = egui::Button::new(RichText::new("📖 How DTAM works: interactive guide").strong().color(Color32::WHITE))
+                .fill(Color32::from_rgb(217, 115, 31));
+            if ui.add(guide).on_hover_text("Every component and equation, from scratch, with diagrams and quizzes").clicked() {
+                ctx.open_url(egui::OpenUrl::same_tab("learn/"));
+            }
         });
         ui.horizontal_wrapped(|ui| {
             let (label, color) = match phase {
